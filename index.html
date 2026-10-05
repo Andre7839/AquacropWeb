@@ -2710,6 +2710,308 @@ function parseCalibrationProject(sheets) {
 
 if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32, sheetsToSectionedCSV, buildProjectSheets, isCalibrationProject, parseCalibrationProject };
 
+// ---------------------------------------------------------------
+// SATELLITE CHECK — Sentinel-2 NDVI at a point from the free Earth Search STAC API
+// (https://earth-search.aws.element84.com/v1). Everything runs in the browser: STAC search, then
+// HTTP range requests straight into the Cloud-Optimised GeoTIFFs (only the few tiles around the
+// point are downloaded), a small TIFF/deflate decoder, UTM projection, SCL cloud masking.
+// ---------------------------------------------------------------
+const STAC_URL = "https://earth-search.aws.element84.com/v1";
+
+// ---- WGS84 → UTM (transverse Mercator series, Snyder 1987) ----
+function latLonToUTM(lat, lon, zone, south) {
+  const a = 6378137, f = 1 / 298.257223563, k0 = 0.9996, e2 = f * (2 - f), ep2 = e2 / (1 - e2);
+  const rad = Math.PI / 180, phi = lat * rad, lam = lon * rad, lam0 = ((zone - 1) * 6 - 180 + 3) * rad;
+  const sinp = Math.sin(phi), cosp = Math.cos(phi), tanp = Math.tan(phi);
+  const N = a / Math.sqrt(1 - e2 * sinp * sinp), T = tanp * tanp, C = ep2 * cosp * cosp, A = (lam - lam0) * cosp;
+  const e4 = e2 * e2, e6 = e4 * e2;
+  const M = a * ((1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * phi - (3 * e2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.sin(2 * phi)
+    + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * phi) - (35 * e6 / 3072) * Math.sin(6 * phi));
+  const x = k0 * N * (A + (1 - T + C) * Math.pow(A, 3) / 6 + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * Math.pow(A, 5) / 120) + 500000;
+  let y = k0 * (M + N * tanp * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * Math.pow(A, 4) / 24 + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * Math.pow(A, 6) / 720));
+  if (south) y += 10000000;
+  return { x, y };
+}
+// "EPSG:32610" / 32610 → {zone, south}; null when it is not a WGS84 UTM code
+function utmFromEPSG(code) {
+  const m = /(\d{5})$/.exec(String(code || "")); if (!m) return null;
+  const n = +m[1];
+  if (n >= 32601 && n <= 32660) return { zone: n - 32600, south: false };
+  if (n >= 32701 && n <= 32760) return { zone: n - 32700, south: true };
+  return null;
+}
+
+// ---- range reads ----
+async function rangeFetch(url, start, end) {
+  const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+  if (r.status === 200) throw new Error("server ignored the byte-range request (would download the whole image)");
+  if (r.status !== 206) throw new Error(`HTTP ${r.status} reading ${url.split("/").pop()}`);
+  return r.arrayBuffer();
+}
+
+// ---- minimal TIFF reader: just enough for tiled, single-band COGs (classic or BigTIFF) ----
+const TIFF_TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 16: 8, 17: 8, 18: 8 };
+async function openCOG(url, fetchRange) {
+  fetchRange = fetchRange || rangeFetch;
+  const HEAD = 131072;
+  let head = await fetchRange(url, 0, HEAD - 1);
+  let hv = new DataView(head);
+  const le = hv.getUint16(0) === 0x4949;
+  if (!le && hv.getUint16(0) !== 0x4d4d) throw new Error("not a TIFF file");
+  const magic = hv.getUint16(2, le), big = magic === 43;
+  if (magic !== 42 && magic !== 43) throw new Error("not a TIFF file");
+  const u64 = (dv, o) => Number(dv.getBigUint64(o, le));
+  const ifdOff = big ? u64(hv, 8) : hv.getUint32(4, le);
+  const bytesAt = async (off, len) => {            // from the header buffer when possible
+    if (off + len <= head.byteLength) return new DataView(head, off, len);
+    return new DataView(await fetchRange(url, off, off + len - 1));
+  };
+  const cnt = big ? u64(await bytesAt(ifdOff, 8), 0) : (await bytesAt(ifdOff, 2)).getUint16(0, le);
+  const esz = big ? 20 : 12, base = ifdOff + (big ? 8 : 2);
+  const ifd = await bytesAt(base, cnt * esz);
+  const tags = {};
+  for (let i = 0; i < cnt; i++) {
+    const o = i * esz, tag = ifd.getUint16(o, le), type = ifd.getUint16(o + 2, le);
+    const n = big ? u64(ifd, o + 4) : ifd.getUint32(o + 4, le);
+    const sz = (TIFF_TYPE_SIZE[type] || 1) * n, inl = big ? 8 : 4, vo = o + (big ? 12 : 8);
+    let dv;
+    if (sz <= inl) dv = new DataView(ifd.buffer, ifd.byteOffset + vo, Math.max(sz, 0));
+    else { const off = big ? u64(ifd, vo) : ifd.getUint32(vo, le); dv = await bytesAt(off, sz); }
+    const out = new Array(n);
+    for (let k = 0; k < n; k++) {
+      switch (type) {
+        case 3: out[k] = dv.getUint16(k * 2, le); break;
+        case 4: out[k] = dv.getUint32(k * 4, le); break;
+        case 16: case 18: out[k] = u64(dv, k * 8); break;
+        case 1: case 7: out[k] = dv.getUint8(k); break;
+        case 2: out[k] = dv.getUint8(k); break;
+        default: out[k] = 0;
+      }
+    }
+    tags[tag] = out;
+  }
+  const one = (t, d) => (tags[t] && tags[t][0] != null ? tags[t][0] : d);
+  const meta = {
+    width: one(256), height: one(257), bits: one(258, 8), comp: one(259, 1), predictor: one(317, 1),
+    tw: one(322), th: one(323), offsets: tags[324], counts: tags[325], fmt: one(339, 1), spp: one(277, 1), planar: one(284, 1), le
+  };
+  if (!meta.tw || !meta.offsets) throw new Error("image is not tiled (not a cloud-optimised GeoTIFF)");
+  if (meta.spp !== 1) throw new Error("multi-band TIFF not supported");
+  if (![1, 8, 32946].includes(meta.comp)) throw new Error(`unsupported TIFF compression (${meta.comp})`);
+  if (![1, 2].includes(meta.predictor)) throw new Error(`unsupported TIFF predictor (${meta.predictor})`);
+  if (![8, 16].includes(meta.bits)) throw new Error(`unsupported bit depth (${meta.bits})`);
+  meta.across = Math.ceil(meta.width / meta.tw);
+  meta.tiles = new Map();
+  meta.url = url; meta.fetchRange = fetchRange;
+  return meta;
+}
+async function inflate(bytes) {
+  const ds = new DecompressionStream("deflate");
+  const w = ds.writable.getWriter(); w.write(bytes); w.close();
+  return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+async function readTile(cog, tx, ty) {
+  const idx = ty * cog.across + tx;
+  if (cog.tiles.has(idx)) return cog.tiles.get(idx);
+  const p = (async () => {
+    const off = cog.offsets[idx], len = cog.counts[idx];
+    if (!len) return null;
+    let raw = new Uint8Array(await cog.fetchRange(cog.url, off, off + len - 1));
+    if (cog.comp !== 1) raw = await inflate(raw);
+    const n = cog.tw * cog.th, bps = cog.bits / 8, out = new Float64Array(n);
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const get = (i) => bps === 1 ? dv.getUint8(i) : dv.getUint16(i * 2, cog.le);
+    for (let r = 0; r < cog.th; r++) {
+      let acc = 0;
+      for (let c = 0; c < cog.tw; c++) {
+        const i = r * cog.tw + c; let v = i * bps < raw.length ? get(i) : 0;
+        if (cog.predictor === 2) { acc = (acc + v) & (bps === 1 ? 0xff : 0xffff); v = acc; }
+        out[i] = v;
+      }
+    }
+    return out;
+  })();
+  cog.tiles.set(idx, p);
+  return p;
+}
+// inclusive pixel window → {w, h, data: Float64Array (NaN outside the image)}
+async function readWindow(cog, x0, y0, x1, y1) {
+  const w = x1 - x0 + 1, h = y1 - y0 + 1, data = new Float64Array(w * h).fill(NaN);
+  const tx0 = Math.max(0, Math.floor(x0 / cog.tw)), tx1 = Math.min(cog.across - 1, Math.floor(x1 / cog.tw));
+  const ty0 = Math.max(0, Math.floor(y0 / cog.th)), ty1 = Math.min(Math.ceil(cog.height / cog.th) - 1, Math.floor(y1 / cog.th));
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+    const tile = await readTile(cog, tx, ty); if (!tile) continue;
+    for (let y = Math.max(y0, ty * cog.th); y <= Math.min(y1, ty * cog.th + cog.th - 1, cog.height - 1); y++)
+      for (let x = Math.max(x0, tx * cog.tw); x <= Math.min(x1, tx * cog.tw + cog.tw - 1, cog.width - 1); x++)
+        data[(y - y0) * w + (x - x0)] = tile[(y - ty * cog.th) * cog.tw + (x - tx * cog.tw)];
+  }
+  return { w, h, data };
+}
+
+// ---- STAC ----
+async function searchSentinel2(lat, lon, startISO, endISO, maxCloud) {
+  const body = {
+    collections: ["sentinel-2-l2a"], intersects: { type: "Point", coordinates: [lon, lat] },
+    datetime: `${startISO}T00:00:00Z/${endISO}T23:59:59Z`, limit: 200,
+    query: { "eo:cloud_cover": { lt: maxCloud } }, sortby: [{ field: "properties.datetime", direction: "asc" }]
+  };
+  const r = await fetch(STAC_URL + "/search", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/geo+json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`Earth Search returned HTTP ${r.status}`);
+  const j = await r.json();
+  const byDate = new Map();                        // one scene per calendar day (overlapping tiles): keep the clearest
+  (j.features || []).forEach(f => {
+    const d = String(f.properties.datetime).slice(0, 10), c = f.properties["eo:cloud_cover"];
+    const cur = byDate.get(d);
+    if (!cur || (c != null && c < (cur.properties["eo:cloud_cover"] ?? 101))) byDate.set(d, f);
+  });
+  return [...byDate.values()].sort((a, b) => a.properties.datetime < b.properties.datetime ? -1 : 1);
+}
+function assetGrid(item, asset) {
+  const a = item.assets[asset];
+  if (!a) throw new Error(`scene has no "${asset}" asset`);
+  const tr = a["proj:transform"] || item.properties["proj:transform"];
+  const code = a["proj:code"] || a["proj:epsg"] || item.properties["proj:code"] || item.properties["proj:epsg"];
+  const utm = utmFromEPSG(code);
+  if (!tr || !utm) throw new Error("scene geometry not supported (needs a UTM grid with proj:transform)");
+  const rb = a["raster:bands"] && a["raster:bands"][0];
+  const baseline = parseFloat(item.properties["s2:processing_baseline"]);
+  const scale = rb && rb.scale != null ? rb.scale : 0.0001;
+  const offset = rb && rb.offset != null ? rb.offset : (baseline >= 4 ? -0.1 : 0);
+  return { href: a.href, tr, utm, scale, offset };
+}
+function pixelOf(grid, lat, lon) {
+  const p = latLonToUTM(lat, lon, grid.utm.zone, grid.utm.south), t = grid.tr;
+  return { col: Math.floor((p.x - t[2]) / t[0]), row: Math.floor((p.y - t[5]) / t[4]) };
+}
+const SCL_OK = new Set([4, 5]);                    // vegetation, bare soil
+// One scene → {ndvi} or null when the point is cloudy/shadowed/outside the tile.
+async function sampleScene(item, lat, lon, opts) {
+  opts = opts || {};
+  const cache = opts.cogCache || new Map();
+  const open = async (key) => {
+    const g = assetGrid(item, key); const ck = g.href;
+    if (!cache.has(ck)) cache.set(ck, openCOG(g.href, opts.fetchRange));
+    return { g, cog: await cache.get(ck) };
+  };
+  const scl = await open("scl"), sp = pixelOf(scl.g, lat, lon);
+  const sw = await readWindow(scl.cog, sp.col - 1, sp.row - 1, sp.col + 1, sp.row + 1);
+  let ok = 0; sw.data.forEach(v => { if (SCL_OK.has(v)) ok++; });
+  if (!SCL_OK.has(sw.data[4]) || ok < 8) return null;      // centre pixel and at least 8 of 9 must be clear vegetation/soil
+  const rad = opts.radius == null ? 1 : opts.radius;
+  const red = await open("red"), nir = await open("nir");
+  const pc = pixelOf(red.g, lat, lon);
+  const win = async (b) => (await readWindow(b.cog, pc.col - rad, pc.row - rad, pc.col + rad, pc.row + rad)).data;
+  const [R, N] = await Promise.all([win(red), win(nir)]);
+  // Average the surface reflectances over the window first, then form NDVI from the means.
+  // (A ratio of per-pixel values blows up when one dark / shadowed / over-corrected pixel has a reflectance
+  // at or below zero — that is what produced NDVI > 1.) Pixels with non-physical reflectance are skipped.
+  const MINR = 0.002;
+  let sr = 0, sn = 0, n = 0;
+  for (let i = 0; i < R.length; i++) {
+    if (!(R[i] > 0) || !(N[i] > 0)) continue;                                     // nodata / outside the image
+    const r = R[i] * red.g.scale + red.g.offset, nn = N[i] * nir.g.scale + nir.g.offset;
+    if (r < MINR || nn < MINR || r > 1.2 || nn > 1.2) continue;
+    sr += r; sn += nn; n++;
+  }
+  if (n < Math.ceil(R.length / 2)) return null;
+  const r = sr / n, nn = sn / n, ndvi = (nn - r) / (nn + r);
+  if (!(ndvi >= -1 && ndvi <= 1)) return null;
+  return { date: String(item.properties.datetime).slice(0, 10), ndvi, cloud: item.properties["eo:cloud_cover"], nPx: n };
+}
+// Whole season: [{date, ndvi}] sorted by date. onProgress(done, total, note)
+async function fetchSatelliteSeries(lat, lon, startISO, endISO, opts) {
+  opts = opts || {};
+  const items = await searchSentinel2(lat, lon, startISO, endISO, opts.maxCloud == null ? 60 : opts.maxCloud);
+  const out = [], errs = [];
+  let done = 0, next = 0;
+  const report = () => opts.onProgress && opts.onProgress(done, items.length);
+  report();
+  const worker = async () => {
+    while (next < items.length) {
+      const it = items[next++];
+      try { const s = await sampleScene(it, lat, lon, opts); if (s) out.push(s); }
+      catch (e) { errs.push(`${String(it.properties.datetime).slice(0, 10)}: ${e.message}`); }
+      done++; report();
+    }
+  };
+  await Promise.all(Array.from({ length: opts.concurrency || 4 }, worker));
+  out.sort((a, b) => a.date < b.date ? -1 : 1);
+  return { points: out, nScenes: items.length, errors: errs };
+}
+
+// ---- comparison with the simulated canopy cover ----
+function pearson(xs, ys) {
+  const n = xs.length; if (n < 3) return null;
+  const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; syy += (ys[i] - my) ** 2; }
+  return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : null;
+}
+// first day a [{day, v}] series reaches frac × its own maximum (linear interpolation)
+function firstReach(series, frac) {
+  const s = series.filter(p => isFinite(p.v)); if (s.length < 2) return null;
+  const mx = Math.max(...s.map(p => p.v)), thr = frac * mx;
+  for (let i = 0; i < s.length; i++) if (s[i].v >= thr) {
+    if (i === 0) return s[0].day;
+    const a = s[i - 1], b = s[i]; return a.day + (b.day - a.day) * (thr - a.v) / ((b.v - a.v) || 1);
+  }
+  return null;
+}
+// pts: [{day, date, ndvi}], daily: [{day, cc}] → summary used under the chart
+function compareWithSimulation(pts, daily) {
+  const cc = new Map(daily.map(r => [r.day, r.cc]));
+  const v = pts.filter(p => cc.has(p.day) && isFinite(p.ndvi));
+  return {
+    n: v.length, r: pearson(v.map(p => cc.get(p.day)), v.map(p => p.ndvi)),
+    rmse: v.length ? Math.sqrt(v.reduce((a, p) => a + (cc.get(p.day) - p.ndvi) ** 2, 0) / v.length) : null,
+    fullNdvi: firstReach(v.map(p => ({ day: p.day, v: p.ndvi })), 0.9), fullSim: firstReach(daily.map(r => ({ day: r.day, v: r.cc })), 0.9)
+  };
+}
+// SVG: simulated canopy cover (area + line) with the NDVI observations on the same 0–1 axis
+function satelliteChart({ daily, pts, nDays }) {
+  const yMax = 1, col = "#e8b04a";
+  let svg = `<svg class="chart" viewBox="0 0 ${CHART_W} ${CHART_H}" xmlns="http://www.w3.org/2000/svg">`;
+  svg += axesSVG(nDays, yMax, v => v.toFixed(1), null, "days after sowing");
+  svg += `<path d="${areaPath(daily, "cc", nDays, yMax)}" fill="#7cab5a" fill-opacity="0.18" stroke="none"/>`;
+  svg += `<path d="${linePath(daily, "cc", nDays, yMax)}" fill="none" stroke="#7cab5a" stroke-width="2"/>`;
+  const v = pts.filter(p => isFinite(p.ndvi) && p.day >= 1 && p.day <= nDays);
+  if (v.length > 1) svg += `<path d="${v.map((p, i) => (i ? "L" : "M") + scaleX(p.day, nDays).toFixed(1) + " " + scaleY(Math.max(0, p.ndvi), yMax).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>`;
+  v.forEach(p => {
+    const x = scaleX(p.day, nDays), y = scaleY(Math.max(0, p.ndvi), yMax), sim = daily.find(r => r.day === p.day);
+    const rows = [{ label: "NDVI", value: p.ndvi.toFixed(2), color: col }];
+    if (sim) rows.push({ label: "Simulated CC", value: sim.cc.toFixed(2), color: "#7cab5a" });
+    svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" fill="${col}" stroke="#fff" stroke-width="1.2"/><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent" pointer-events="all" data-tip='${tipHTML(p.date + " · day " + p.day, rows)}'/>`;
+  });
+  return svg + "</svg>";
+}
+
+// Canopy-cover chart for the Results tab: simulated CC on the left axis (%), NDVI observations on a right (Y2) axis (0–1)
+function ccNdviChart({ daily, pts, nDays }) {
+  const yMax = 1, col = "#e8b04a", W = CHART_W + 40;
+  let svg = `<svg class="chart" viewBox="0 0 ${W} ${CHART_H}" xmlns="http://www.w3.org/2000/svg">`;
+  svg += axesSVG(nDays, yMax, v => (v * 100).toFixed(0) + "%", null, "days after sowing");
+  svg += `<path d="${areaPath(daily, "cc", nDays, yMax)}" fill="#7cab5a" fill-opacity="0.18" stroke="none"/>`;
+  svg += `<path d="${linePath(daily, "cc", nDays, yMax)}" fill="none" stroke="#7cab5a" stroke-width="2"/>`;
+  const x2 = CHART_W - PAD_R;
+  svg += `<line x1="${x2}" y1="${PAD_T}" x2="${x2}" y2="${CHART_H - PAD_B}" stroke="${col}" stroke-width="1" opacity="0.8"/>`;
+  for (let i = 0; i <= 4; i++) {
+    const v = i / 4, y = scaleY(v, yMax);
+    svg += `<line x1="${x2}" y1="${y.toFixed(1)}" x2="${x2 + 4}" y2="${y.toFixed(1)}" stroke="${col}"/><text x="${x2 + 7}" y="${(y + 3).toFixed(1)}" font-size="9" fill="${col}" font-family="var(--font-mono)">${v.toFixed(2)}</text>`;
+  }
+  svg += `<text transform="translate(${W - 3} ${(PAD_T + CHART_H - PAD_B) / 2}) rotate(-90)" text-anchor="middle" font-size="9" fill="${col}">NDVI (Sentinel-2)</text>`;
+  const v = pts.filter(p => isFinite(p.ndvi) && p.day >= 1 && p.day <= nDays);
+  if (v.length > 1) svg += `<path d="${v.map((p, i) => (i ? "L" : "M") + scaleX(p.day, nDays).toFixed(1) + " " + scaleY(Math.max(0, p.ndvi), yMax).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>`;
+  v.forEach(p => {
+    const x = scaleX(p.day, nDays), y = scaleY(Math.max(0, p.ndvi), yMax), sim = daily.find(r => r.day === p.day);
+    const rows = [{ label: "NDVI", value: p.ndvi.toFixed(2), color: col }];
+    if (sim) rows.push({ label: "Simulated CC", value: (sim.cc * 100).toFixed(0) + "%", color: "#7cab5a" });
+    svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" fill="${col}" stroke="#fff" stroke-width="1.2"/><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent" pointer-events="all" data-tip='${tipHTML(p.date + " · day " + p.day, rows)}'/>`;
+  });
+  return svg + "</svg>";
+}
+
+if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, utmFromEPSG, openCOG, readWindow, searchSentinel2, sampleScene, fetchSatelliteSeries, assetGrid, pixelOf, pearson, firstReach, compareWithSimulation, satelliteChart, STAC_URL };
+
 </script>
 <script>
 // ===================== AquaCrop-Web app logic =====================
@@ -2757,6 +3059,22 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
   // ---------------------------------------------------------------
   // SETUP TAB
   // ---------------------------------------------------------------
+  // Stage timing used by a scenario: the crop's current parameters (Parameters tab), in calendar days or in
+  // accumulated GDD (gddCycle when set, otherwise an estimate converted from the day values).
+  function scenarioStages(cropKey, mode, Tbase) {
+    const c = getCropDef(cropKey), d = stageDefaultsFromCrop(cropKey), gcal = c.gddCycle, useCal = mode === "gdd" && gcal;
+    const conv = (days, ck) => useCal && gcal[ck] != null ? gcal[ck] : (days == null ? null : (mode === "gdd" ? gddDefaultFromDays(days, Tbase == null || isNaN(Tbase) ? c.Tbase : Tbase) : days));
+    const mx = (v, lo, fb) => v == null || isNaN(v) ? fb : Math.max(v, lo);
+    return {
+      emergence: mx(conv(d.emergence, "emergence"), 0, c.cycle.emergence),
+      maxCanopy: mx(conv(d.maxcanopy, "maxCanopy"), 1, c.cycle.maxCanopy),
+      senescStart: mx(conv(d.senescence, "senescStart"), 1, c.cycle.senescStart),
+      flowering: d.flowering == null ? null : conv(d.flowering, "flowering"),
+      floweringDur: conv(d.floweringdur, "floweringDur") || 0,
+      maturity: mx(conv(d.maturity, "maturity"), 1, c.cycle.maturity)
+    };
+  }
+
   function cropSoilLocStageHTML(prefix, sowDateDefault) {
     return `
         <div class="field">
@@ -2783,7 +3101,7 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
         </div>
 
         <fieldset>
-          <legend id="${prefix}-stage-legend">Growing stage lengths</legend>
+          <legend id="${prefix}-stage-legend">Growing stage timing</legend>
           <div class="radiorow">
             <label><input type="radio" name="${prefix}-phenmode" value="calendar" checked> Calendar days</label>
             <label><input type="radio" name="${prefix}-phenmode" value="gdd"> Growing degree-days (GDD)</label>
@@ -2795,15 +3113,7 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
             </div>
             <div class="hint">GDD accrues daily as (capped Tmax + floored Tmin)/2 − T<sub>base</sub>. Requires daily Tmax/Tmin — available from NASA POWER automatically, or from an uploaded CSV with <code>tmax,tmin</code> columns. If a day's temperature isn't available, that day simply contributes no heat units.</div>
           </div>
-          <div class="grid cols-3">
-            <div class="field"><label id="${prefix}-lbl-emergence">Emergence (days)</label><input type="number" id="${prefix}-stage-emergence" min="0" step="1"></div>
-            <div class="field"><label id="${prefix}-lbl-maxcanopy">Max canopy reached (days)</label><input type="number" id="${prefix}-stage-maxcanopy" min="1" step="1"></div>
-            <div class="field"><label id="${prefix}-lbl-senescence">Senescence start (days)</label><input type="number" id="${prefix}-stage-senescence" min="1" step="1"></div>
-            <div class="field"><label id="${prefix}-lbl-flowering">Flowering start (days, blank = none)</label><input type="number" id="${prefix}-stage-flowering" min="0" step="1"></div>
-            <div class="field"><label id="${prefix}-lbl-floweringdur">Flowering duration (days)</label><input type="number" id="${prefix}-stage-floweringdur" min="0" step="1"></div>
-            <div class="field"><label id="${prefix}-lbl-maturity">Maturity / harvest (days)</label><input type="number" id="${prefix}-stage-maturity" min="1" step="1"></div>
-          </div>
-          <div class="hint" id="${prefix}-stage-hint">Pre-filled from the selected crop's typical cycle — edit to match your cultivar or observed local phenology. Keep them increasing left to right (emergence &lt; max canopy &lt; senescence &lt; maturity) for a sensible curve.</div>
+          <div class="hint" id="${prefix}-stage-summary"></div>
         </fieldset>`;
   }
 
@@ -2995,40 +3305,18 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
       if (g("tbase")) g("tbase").value = c.Tbase;
       if (g("tupper")) g("tupper").value = c.Tupper;
     }
-    const stageLabelText = {
-      emergence: "Emergence", maxcanopy: "Max canopy reached", senescence: "Senescence start",
-      flowering: "Flowering start", floweringdur: "Flowering duration", maturity: "Maturity / harvest"
-    };
-    function updateStageLabels() {
-      const unit = currentPhenMode() === "gdd" ? "GDD" : "days";
-      Object.keys(stageLabelText).forEach(k => {
-        const el = g("lbl-" + k);
-        if (!el) return;
-        el.textContent = stageLabelText[k] + (k === "flowering" ? ` (${unit}, blank = none)` : ` (${unit})`);
-      });
-      const legend = g("stage-legend");
-      if (legend) legend.textContent = currentPhenMode() === "gdd" ? "Growing stage thresholds (accumulated GDD)" : "Growing stage lengths (days after sowing)";
-    }
     function refreshStageDefaults() {
-      const d = stageDefaultsFromCrop(cropSel.value);
-      const mode = currentPhenMode();
-      const Tbase = g("tbase") && g("tbase").value !== "" ? parseFloat(g("tbase").value) : getCropDef(cropSel.value).Tbase;
-      const gcal = getCropDef(cropSel.value).gddCycle;
-      const useCal = mode === "gdd" && gcal;
-      const conv = (days, ck) => useCal && gcal[ck] != null ? gcal[ck] : (days == null ? null : (mode === "gdd" ? gddDefaultFromDays(days, Tbase) : days));
-      g("stage-emergence").value = conv(d.emergence, "emergence");
-      g("stage-maxcanopy").value = conv(d.maxcanopy, "maxCanopy");
-      g("stage-senescence").value = conv(d.senescence, "senescStart");
-      g("stage-flowering").value = d.flowering == null ? "" : conv(d.flowering, "flowering");
-      g("stage-floweringdur").value = conv(d.floweringdur, "floweringDur");
-      g("stage-maturity").value = conv(d.maturity, "maturity");
-      updateStageLabels();
+      const mode = currentPhenMode(), Tbase = g("tbase") && g("tbase").value !== "" ? parseFloat(g("tbase").value) : getCropDef(cropSel.value).Tbase;
+      const st = scenarioStages(cropSel.value, mode, Tbase), unit = mode === "gdd" ? "GDD" : "days";
+      const f = v => v == null || isNaN(v) ? "–" : Math.round(v);
+      g("stage-summary").innerHTML = `Stage timing for <strong>${getCropDef(cropSel.value).label}</strong> comes from the <strong>Parameters</strong> tab (${unit} after sowing): emergence ${f(st.emergence)} · max canopy ${f(st.maxCanopy)} · flowering ${st.flowering == null ? "none" : f(st.flowering)}${st.flowering == null ? "" : " (" + f(st.floweringDur) + " long)"} · senescence ${f(st.senescStart)} · maturity ${f(st.maturity)}. Edit them there${mode === "gdd" ? " (the GDD column; blank falls back to an estimate from the day values)" : ""}.`;
     }
     cropSel.addEventListener("change", () => { refreshMeta(); refreshTempDefaults(); refreshStageDefaults(); });
     refreshMeta();
     refreshTempDefaults();
     refreshStageDefaults();
-    cropOverrideListeners.push((changedKey) => { if (changedKey === cropSel.value) refreshMeta(); });
+    cropOverrideListeners.push((changedKey) => { if (changedKey === cropSel.value) { refreshMeta(); refreshStageDefaults(); } });
+    if (g("tbase")) g("tbase").addEventListener("change", refreshStageDefaults);
     wireModeToggle(container, `${prefix}-irrmode`, `${prefix}-irr-`);
     wireScheduleImport(prefix, container);
     wireModeToggle(container, `${prefix}-phenmode`, `${prefix}-phen-`);
@@ -3260,21 +3548,7 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
     const Tbase = isNaN(TbaseIn) ? baseCrop.Tbase : TbaseIn;
     const Tupper = isNaN(TupperIn) ? baseCrop.Tupper : TupperIn;
 
-    const stageEmergence = parseFloat(g("stage-emergence").value);
-    const stageMaxCanopy = parseFloat(g("stage-maxcanopy").value);
-    const stageSenescence = parseFloat(g("stage-senescence").value);
-    const stageFloweringRaw = g("stage-flowering").value;
-    const stageFlowering = stageFloweringRaw === "" ? null : parseFloat(stageFloweringRaw);
-    const stageFloweringDur = parseFloat(g("stage-floweringdur").value) || 0;
-    const stageMaturity = parseFloat(g("stage-maturity").value);
-    const cycle = {
-      emergence: isNaN(stageEmergence) ? baseCrop.cycle.emergence : Math.max(stageEmergence, 0),
-      maxCanopy: isNaN(stageMaxCanopy) ? baseCrop.cycle.maxCanopy : Math.max(stageMaxCanopy, 1),
-      senescStart: isNaN(stageSenescence) ? baseCrop.cycle.senescStart : Math.max(stageSenescence, 1),
-      flowering: stageFlowering,
-      floweringDur: stageFloweringDur,
-      maturity: isNaN(stageMaturity) ? baseCrop.cycle.maturity : Math.max(stageMaturity, 1)
-    };
+    const cycle = scenarioStages(cropKey, phenologyMode, Tbase);
     const crop = Object.assign({}, baseCrop, { cycle, Tbase, Tupper });
 
     let nDays;
@@ -3312,7 +3586,7 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
     const { common, weather, wxNote } = prep;
     const { crop, soil, sowDate, mgmt, irrigationEvents, phenologyMode } = common;
     const result = runSimulation({ crop, soil, weather, irrigationEvents, mgmt, phenologyMode });
-    return { cropKey: common.cropKey, crop, soil, sowDate, weather, mgmt, result, wxNote, label: crop.label + " · " + soil.label };
+    return { cropKey: common.cropKey, crop, soil, sowDate, weather, mgmt, result, wxNote, lat: common.lat, lon: common.lon, label: crop.label + " · " + soil.label };
   }
 
   // Reads the form and assembles weather; shared by single runs and field-data calibration.
@@ -3452,6 +3726,32 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
     return `<div class="readout-grid">` + items.map(i => `<div class="readout-item"><span class="lbl">${i[0]}</span><span class="val">${i[1]}</span></div>`).join("") + `</div>`;
   }
 
+  // NDVI for the simulated season, fetched in the background and added to the canopy chart on a second (right) axis
+  async function attachNdviToResults(idPrefix, scn, daily) {
+    const chartEl = document.getElementById(`${idPrefix}-cc-chart`), st = document.getElementById(`${idPrefix}-ndvi-status`);
+    if (!chartEl || !st) return;
+    const nDays = daily.length, start = scn.sowDate, end = isoAdd(start, nDays - 1), key = [scn.lat, scn.lon, start, end].join("|");
+    const stale = () => document.getElementById(`${idPrefix}-cc-chart`) !== chartEl;
+    const draw = (series) => {
+      const pts = series.points.map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= nDays);
+      if (pts.length) chartEl.innerHTML = ccNdviChart({ daily, pts, nDays });
+      const cmp = compareWithSimulation(pts, daily), f = (v, d) => v == null || isNaN(v) ? "–" : v.toFixed(d);
+      let t = `NDVI for ${start} → ${end} at ${scn.lat.toFixed(3)}, ${scn.lon.toFixed(3)}: ${series.nScenes} Sentinel-2 scene${series.nScenes === 1 ? "" : "s"} found, ${pts.length} clear.`;
+      if (series.errors.length) t += ` ${series.errors.length} could not be read.`;
+      if (pts.length >= 3) t += ` Simulated canopy vs NDVI: r = ${f(cmp.r, 2)}. NDVI is an index, not canopy cover — compare timing and shape.`;
+      else if (!pts.length) t += " No usable observations, so none are plotted.";
+      st.textContent = t;
+    };
+    if (satCache.has(key)) { draw(satCache.get(key)); return; }
+    if (start > new Date().toISOString().slice(0, 10)) { st.textContent = "NDVI not available: the simulated season starts in the future."; return; }
+    st.innerHTML = '<span class="spinner"></span>Fetching Sentinel-2 NDVI for the simulated season…';
+    try {
+      const series = await fetchSatelliteSeries(scn.lat, scn.lon, start, end, { onProgress: (d, n) => { if (!stale()) st.innerHTML = `<span class="spinner"></span>Reading Sentinel-2 scene ${Math.min(d + 1, n)} of ${n}…`; } });
+      satCache.set(key, series);
+      if (!stale()) draw(series);
+    } catch (e) { if (!stale()) st.innerHTML = `<span class="status err">NDVI could not be retrieved (${e.message}); the simulation itself is unaffected.</span>`; }
+  }
+
   function renderResultsPanel(container, scn, idPrefix) {
     const daily = scn.result.daily;
     const nDays = daily.length;
@@ -3465,7 +3765,8 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
     html += `<div class="panel"><h2>Canopy cover &amp; root development</h2>
       <div class="chartwrap"><h3>Canopy cover over the season</h3>
         <div id="${idPrefix}-cc-chart"></div>
-        <div class="legend"><span><span class="sw" style="background:var(--canopy-400)"></span>Canopy cover (fraction of ground shaded)</span></div>
+        <div class="legend"><span><span class="sw" style="background:var(--canopy-400)"></span>Canopy cover (fraction of ground shaded, left axis)</span><span><span class="sw" style="background:#e8b04a"></span>Sentinel-2 NDVI (right axis, Y2)</span></div>
+        <div class="hint" id="${idPrefix}-ndvi-status"></div>
       </div></div>`;
 
     html += `<div class="panel"><h2>Soil water balance</h2>
@@ -3508,6 +3809,7 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
 
     container.innerHTML = html;
 
+    if (scn.lat != null) attachNdviToResults(idPrefix, scn, daily); else document.getElementById(`${idPrefix}-ndvi-status`).textContent = "";
     // draw charts
     document.getElementById(`${idPrefix}-cc-chart`).innerHTML = lineChart({ data: daily, series: [{ key: "cc", color: "#7cab5a", area: true, label: "Canopy cover" }], nDays, yMax: 1.0, yFmt: v => (v * 100).toFixed(0) + "%" });
 
@@ -3800,41 +4102,17 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
         <span id="cal-status"></span>
         <button class="btn ghost" id="cal-reset">Reset this crop to built-in defaults</button>
       </div>
+      <div class="btnrow" style="margin:-8px 0 18px;">
+        <button class="btn secondary" id="cal-import">Import crop parameters…</button>
+        <input type="file" id="cal-import-file" accept=".csv,.txt,.xlsx,.xlsm" multiple style="display:none;">
+        <button class="btn secondary" id="cal-export">Export this crop (.csv)</button>
+        <button class="btn ghost" id="cal-export-all">Export all customised crops (.csv)</button>
+        <span id="cal-io-status"></span>
+      </div>
+      <div class="hint" style="margin-top:-10px;margin-bottom:14px;">Save a calibrated crop (from the Calibration tab, or values you typed in from a paper) and load it again later. Import accepts files exported here and the parameter file written by the Calibration tab (columns <code>crop, parameter, value</code> or <code>…, calibrated</code>).</div>
 
       <div class="grid cols-2">
         <div>
-          <fieldset>
-            <legend>Canopy development</legend>
-            <div class="row-inline">
-              <div class="field"><label>Initial canopy cover, CC₀ (fraction)</label><input type="number" id="cal-CCo" step="0.001" min="0.001" max="0.3"></div>
-              <div class="field"><label>Max canopy cover, CCx (fraction)</label><input type="number" id="cal-CCx" step="0.01" min="0.1" max="1"></div>
-            </div>
-            <label style="display:flex;align-items:center;gap:6px;margin:6px 0 10px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-autoRates" style="width:auto;" checked> Auto-derive canopy growth/decline rate from stage lengths (recommended)</label>
-            <div class="row-inline">
-              <div class="field"><label>Canopy growth coefficient, CGC (/day)</label><input type="number" id="cal-CGC" step="0.001" min="0.001" max="0.5"></div>
-              <div class="field"><label>Canopy decline coefficient, CDC (/day)</label><input type="number" id="cal-CDC" step="0.001" min="0.001" max="0.5"></div>
-            </div>
-            <div class="hint">Uncheck to set literal calibrated coefficients — the way a calibrated AquaCrop crop file specifies them directly.</div>
-          </fieldset>
-
-          <fieldset>
-            <legend>Root system &amp; transpiration</legend>
-            <div class="row-inline">
-              <div class="field"><label>Min root depth, Z<sub>min</sub> (m)</label><input type="number" id="cal-Zmin" step="0.05" min="0.1" max="1"></div>
-              <div class="field"><label>Max root depth, Z<sub>max</sub> (m)</label><input type="number" id="cal-Zmax" step="0.05" min="0.2" max="3"></div>
-            </div>
-            <div class="row-inline">
-              <div class="field"><label>Crop coefficient at full canopy, Kcb</label><input type="number" id="cal-Kcb" step="0.01" min="0.5" max="1.5"></div>
-              <div class="field"><label>Late-season ageing decline (%/day)</label><input type="number" id="cal-fage" step="0.01" min="0" max="1"></div>
-            </div>
-          </fieldset>
-
-          <fieldset>
-            <legend>Crop behavior</legend>
-            <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-forage" style="width:auto;"> Forage/hay crop (yield = total biomass, no harvest-index build-up)</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-ponded" style="width:auto;"> Paddy/ponded crop (exempt from the waterlogging penalty)</label>
-          </fieldset>
-
           <fieldset>
             <legend>Phenology (default stage timing)</legend>
             <div class="hint" style="margin-top:-4px;margin-bottom:8px;">Used to pre-fill the stage fields in Setup, Compare and Historical. Calendar days after sowing, or accumulated GDD when a scenario is switched to GDD mode (leave the GDD column blank to use the automatic estimate).</div>
@@ -3845,25 +4123,74 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
               <div class="field"><label>Upper cap, T<sub>upper</sub> (°C)</label><input type="number" id="cal-Tupper" step="0.5"></div>
             </div>
           </fieldset>
-        </div>
 
+          <fieldset>
+            <legend>Canopy cover &amp; rooting (cultivar / management dependent)</legend>
+            <div class="row-inline">
+              <div class="field"><label>Initial canopy cover, CC₀ (fraction)</label><input type="number" id="cal-CCo" step="0.001" min="0.001" max="0.3"></div>
+              <div class="field"><label>Max canopy cover, CCx (fraction)</label><input type="number" id="cal-CCx" step="0.01" min="0.1" max="1"></div>
+            </div>
+            <div class="hint" style="margin-top:-2px;margin-bottom:8px;">CC₀ reflects planting density and transplant/seed size; CCx reflects cultivar, density and management.</div>
+            <div class="row-inline">
+              <div class="field"><label>Min root depth, Z<sub>min</sub> (m)</label><input type="number" id="cal-Zmin" step="0.05" min="0.1" max="1"></div>
+              <div class="field"><label>Max root depth, Z<sub>max</sub> (m)</label><input type="number" id="cal-Zmax" step="0.05" min="0.2" max="3"></div>
+            </div>
+          </fieldset>
+        </div>
         <div>
           <fieldset>
-            <legend>Biomass &amp; yield</legend>
-            <div class="row-inline">
-              <div class="field"><label>Normalized water productivity, WP* (g/m²)</label><input type="number" id="cal-WP" step="0.5" min="5" max="45"></div>
-              <div class="field"><label>WP adjustment in yield formation (%)</label><input type="number" id="cal-WPyield" step="1" min="50" max="150"></div>
-            </div>
+            <legend>Yield formation (cultivar dependent)</legend>
             <div class="row-inline">
               <div class="field"><label>Reference harvest index, HI₀ (%)</label><input type="number" id="cal-HI0" step="1" min="0" max="100"></div>
               <div class="field"><label>Dry-matter fraction of harvested product</label><input type="number" id="cal-dm" step="0.01" min="0.03" max="1"></div>
             </div>
-            <div class="row-inline">
-              <div class="field"><label>HI boost from mild pre-flowering stress (%)</label><input type="number" id="cal-dHIpre" step="0.5" min="0" max="20"></div>
-              <div class="field"><label>HI penalty from late-season stress (%)</label><input type="number" id="cal-bHI" step="0.5" min="0" max="20"></div>
-            </div>
           </fieldset>
 
+          <fieldset>
+            <legend>Crop behavior</legend>
+            <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-forage" style="width:auto;"> Forage/hay crop (yield = total biomass, no harvest-index build-up)</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-ponded" style="width:auto;"> Paddy/ponded crop (exempt from the waterlogging penalty)</label>
+          </fieldset>
+        </div>
+      </div>
+
+      <details id="cal-adv" style="margin-top:14px;border:1px solid var(--line, #5a4a3a);border-radius:8px;padding:10px 14px;">
+        <summary style="cursor:pointer;font-weight:600;">Advanced — conservative parameters <span id="cal-adv-flag" style="font-weight:400;font-size:0.82rem;"></span></summary>
+        <div class="hint" style="margin:10px 0;border-left:3px solid #d98a1c;padding:6px 10px;"><strong>Change these only if you are sure.</strong> Water productivity (WP*), canopy growth/decline rates, Kcb, harvest-index stress effects and the water-stress thresholds are <em>conservative</em>: they are meant to stay nearly constant across sites, seasons and cultivars of a crop. Edit them only with values calibrated under real, well-controlled field conditions (your own trial data or a published calibration). Guessing here shifts every simulation that uses this crop.</div>
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:0.88rem;color:var(--paper);"><input type="checkbox" id="cal-adv-unlock" style="width:auto;"> I understand — unlock editing of conservative parameters</label>
+        <div id="cal-adv-body" class="grid cols-2">
+          <div>
+            <fieldset>
+              <legend>Canopy growth &amp; decline rates</legend>
+              <label style="display:flex;align-items:center;gap:6px;margin:0 0 10px;font-size:0.85rem;color:var(--paper);"><input type="checkbox" id="cal-autoRates" style="width:auto;" checked> Auto-derive canopy growth/decline rate from stage lengths (recommended)</label>
+              <div class="row-inline">
+                <div class="field"><label>Canopy growth coefficient, CGC (/day)</label><input type="number" id="cal-CGC" step="0.001" min="0.001" max="0.5"></div>
+                <div class="field"><label>Canopy decline coefficient, CDC (/day)</label><input type="number" id="cal-CDC" step="0.001" min="0.001" max="0.5"></div>
+              </div>
+              <div class="hint">Uncheck to set literal calibrated coefficients — the way a calibrated AquaCrop crop file specifies them directly.</div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Transpiration &amp; ageing</legend>
+              <div class="row-inline">
+                <div class="field"><label>Crop coefficient at full canopy, Kcb</label><input type="number" id="cal-Kcb" step="0.01" min="0.5" max="1.5"></div>
+                <div class="field"><label>Late-season ageing decline (%/day)</label><input type="number" id="cal-fage" step="0.01" min="0" max="1"></div>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Biomass &amp; harvest-index response</legend>
+              <div class="row-inline">
+                <div class="field"><label>Normalized water productivity, WP* (g/m²)</label><input type="number" id="cal-WP" step="0.5" min="5" max="45"></div>
+                <div class="field"><label>WP adjustment in yield formation (%)</label><input type="number" id="cal-WPyield" step="1" min="50" max="150"></div>
+              </div>
+              <div class="row-inline">
+                <div class="field"><label>HI boost from mild pre-flowering stress (%)</label><input type="number" id="cal-dHIpre" step="0.5" min="0" max="20"></div>
+                <div class="field"><label>HI penalty from late-season stress (%)</label><input type="number" id="cal-bHI" step="0.5" min="0" max="20"></div>
+              </div>
+            </fieldset>
+          </div>
+          <div>
           <fieldset>
             <legend>Water stress response thresholds</legend>
             <div class="hint" style="margin-top:-4px;margin-bottom:10px;">Each p is the fraction of total available water depleted before that response kicks in — lower p means more sensitive. Shape controls how abruptly the response ramps up (higher = more abrupt).</div>
@@ -3881,14 +4208,154 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
             </div>
             <div class="field"><label>Pollination-failure threshold, p<sub>pol</sub> (blank = not sensitive)</label><input type="number" id="cal-pPol" step="0.05" min="0" max="1"></div>
           </fieldset>
+          </div>
         </div>
-      </div>
+      </details>
     </div>
 
     <div class="panel">
-      <h2>Canopy development preview<small>Canopy cover over the crop's default cycle length, unstressed, using the parameters above.</small></h2>
+      <h2>Canopy development preview<small>Canopy cover over the crop's default cycle length, unstressed, using the parameters above. Add satellite NDVI below to check it.</small></h2>
       <div class="chartwrap"><div id="cal-preview-chart"></div></div>
+      <div id="cal-sat"></div>
     </div>`;
+  }
+
+  const ADV_FIELDS = ["CGC", "CDC", "Kcb", "fage", "WP", "WPyield", "dHIpre", "bHI", "pExpUpper", "shapeExp", "pSto", "shapeSto", "pSen", "shapeSen", "pPol"];
+  const BOOL_FIELDS = ["forage", "ponded", "useManualRates"];
+  function cropKeyFromName(name) {
+    const n = String(name || "").trim().toLowerCase();
+    return Object.keys(CROPS).find(k => k.toLowerCase() === n || CROPS[k].label.toLowerCase() === n) || null;
+  }
+  // Every parameter of a crop as [name, value] rows (the effective values, built-in + overrides)
+  function cropParamRows(cropKey) {
+    const c = getCropDef(cropKey), rows = [];
+    CAL_FIELDS.forEach(f => { if (c[f] != null) rows.push([f, c[f]]); });
+    if (!c.useManualRates) { const r = deriveCanopyRates(c); rows.push(["CGC", +r.CGC.toFixed(5)], ["CDC", +r.CDC.toFixed(5)]); }
+    PHENO_FORM.forEach(([k]) => { if (c.cycle[k] != null) rows.push(["cycle." + k, c.cycle[k]]); });
+    if (c.gddCycle) PHENO_FORM.forEach(([k]) => { if (c.gddCycle[k] != null) rows.push(["gddCycle." + k, c.gddCycle[k]]); });
+    BOOL_FIELDS.forEach(f => rows.push([f, c[f] ? 1 : 0]));
+    return rows;
+  }
+  function cropParamsCSV(cropKeys) {
+    const q = v => /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v;
+    const out = ["# AquaCrop-Web crop parameters — one row per parameter; edit values and re-import", "crop,parameter,value"];
+    cropKeys.forEach(k => cropParamRows(k).forEach(([p, v]) => out.push([q(CROPS[k].label), p, v].join(","))));
+    return out.join("\n") + "\n";
+  }
+  // rows → { cropKey: patch }, plus warnings
+  function parseCropParamRows(rows) {
+    const warns = [], patches = {};
+    rows = rows.filter(r => r.length && !String(r[0]).trim().startsWith("#") && r.some(c => String(c).trim() !== ""));
+    const hi = rows.findIndex(r => r.some(c => /^parameter$/i.test(String(c).trim())));
+    if (hi < 0) throw new Error("no 'parameter' column found — expected columns: crop, parameter, value");
+    const head = rows[hi].map(c => String(c).trim().toLowerCase());
+    const ic = head.indexOf("crop"), ip = head.indexOf("parameter");
+    let iv = head.indexOf("calibrated"); if (iv < 0) iv = head.indexOf("value");
+    if (iv < 0) throw new Error("no 'value' (or 'calibrated') column found");
+    const seen = {};
+    rows.slice(hi + 1).forEach(r => {
+      const pn = String(r[ip] == null ? "" : r[ip]).trim(); if (!pn || pn.startsWith("#")) return;
+      const key = cropKeyFromName(ic >= 0 ? r[ic] : null);
+      if (!key) { const nm = ic >= 0 ? String(r[ic]).trim() : ""; if (nm && !warns.includes(`crop "${nm}" not recognised — rows skipped`)) warns.push(`crop "${nm}" not recognised — rows skipped`); return; }
+      const raw = r[iv], p = (patches[key] = patches[key] || { _cyc: {}, _gdd: {} });
+      seen[key] = seen[key] || new Set(); seen[key].add(pn);
+      if (pn.startsWith("cycle.")) { const v = toNum(raw); if (!isNaN(v)) p._cyc[pn.slice(6)] = v; return; }
+      if (pn.startsWith("gddCycle.")) { const v = toNum(raw); if (!isNaN(v)) p._gdd[pn.slice(9)] = v; return; }
+      if (BOOL_FIELDS.includes(pn)) { const t = String(raw).trim().toLowerCase(); p[pn] = t === "1" || t === "true" || t === "yes"; return; }
+      if (CAL_FIELDS.includes(pn)) { if (String(raw).trim() === "" && pn === "pPol") { p[pn] = null; return; } const v = toNum(raw); if (!isNaN(v)) p[pn] = v; else warns.push(`${CROPS[key].label}: ${pn} = "${raw}" is not a number — ignored`); return; }
+      warns.push(`unknown parameter "${pn}" ignored`);
+    });
+    Object.keys(patches).forEach(key => {
+      const p = patches[key], base = getCropDef(key);
+      if (Object.keys(p._cyc).length) p.cycle = Object.assign({}, base.cycle, p._cyc);
+      if (Object.keys(p._gdd).length) p.gddCycle = Object.assign({}, base.gddCycle || {}, p._gdd);
+      delete p._cyc; delete p._gdd;
+      if (!("useManualRates" in p) && seen[key].has("CGC") && seen[key].has("CDC")) p.useManualRates = true;
+    });
+    return { patches, warns };
+  }
+
+  // ---------- Satellite NDVI on the canopy development review (+ optional fit of the canopy to NDVI) ----------
+  const satCache = new Map();
+  function mountSeasonSatellite(host, o) {
+    const thisYear = new Date().getFullYear(), yearOpts = [];
+    for (let y = thisYear; y >= 2017; y--) yearOpts.push(`<option value="${y}">${y}</option>`);
+    host.innerHTML = `<div style="margin-top:18px;border-top:1px solid var(--line-soft);padding-top:12px;">
+      <h3 style="margin-top:0;">Check against satellite — Sentinel-2 NDVI</h3>
+      <div class="hint" style="margin-bottom:10px;">Pick the growing season to read. NDVI measured at your field coordinates is added to the canopy chart above (<span style="color:#7cab5a">▬</span> simulated canopy cover in %, left axis; <span style="color:#e8b04a">●</span> NDVI, right Y2 axis), so you can judge whether the canopy timing and shape make sense.</div>
+      <div class="grid cols-3">
+        <div class="field"><label>1 · Growing-season year</label><select data-sat="year"><option value="">Select a year…</option>${yearOpts.join("")}</select></div>
+        <div class="field"><label>Planting date</label><input type="date" data-sat="start"></div>
+        <div class="field"><label>Harvest / season end</label><input type="date" data-sat="end"></div>
+      </div>
+      <div class="hint" data-sat="loc"></div>
+      <div class="btnrow" style="align-items:center;gap:10px;flex-wrap:wrap;">
+        <button class="btn secondary" data-sat="go" disabled>2 · Fetch NDVI</button>
+        <span data-sat="status"><span class="status">Select a year to enable.</span></span>
+      </div>
+      <div class="hint" data-sat="stats"></div>
+      <div data-sat="fitbox" style="display:none;margin-top:10px;border:1px solid var(--line-soft);border-radius:8px;padding:10px 12px;">
+        <strong>3 · Adjust the growing-season pattern to the NDVI</strong>
+        <div class="hint" style="margin:6px 0;">Keeps the canopy-cover range (CC₀ and CCx) exactly as set above and assumes canopy cover is proportional to NDVI: the season's NDVI is rescaled onto that range and the growth coefficient (CGC), decline coefficient (CDC), full-canopy day and senescence start are refitted so the curve follows the NDVI pattern in time. NDVI also sees soil background and saturates when the canopy is dense, so the shape is more reliable than any single value — check it against more than one season.</div>
+        <div class="btnrow" style="align-items:center;gap:10px;flex-wrap:wrap;">
+          <button class="btn" data-sat="fit">Adjust season pattern to NDVI</button>
+          <button class="btn ghost" data-sat="undo" disabled>Undo adjustment</button>
+          <span data-sat="fitmsg"></span>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:10px;">Data: Sentinel-2 L2A from the Earth Search catalogue (free, no key), clouds and shadows removed with the scene classification layer; red and near-infrared reflectances are averaged over the 3×3 pixels (≈30 m) at the field coordinates before NDVI = (NIR−Red)/(NIR+Red) is formed, so values stay within −1…1. Make sure the coordinates fall inside the field. Only a few image tiles around the point are downloaded (a few MB per clear scene), so it can take a minute.</div></div>`;
+    const q = k => host.querySelector(`[data-sat="${k}"]`);
+    const keyNow = () => [sharedLocation.lat, sharedLocation.lon, q("start").value, q("end").value].join("|");
+    const showLoc = () => { q("loc").textContent = `Location: ${sharedLocation.lat.toFixed(4)}, ${sharedLocation.lon.toFixed(4)} (set on the Location tab).`; };
+    // NDVI points for the selected season, as day-after-planting, or null
+    function overlay() {
+      const series = satCache.get(keyNow()); if (!series || !q("start").value || !q("end").value) return null;
+      const start = q("start").value, seasonDays = daysBetweenISO(start, q("end").value) + 1;
+      const pts = series.points.map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= seasonDays);
+      return { pts, seasonDays, series };
+    }
+    function update() {
+      const ov = overlay();
+      if (!ov) { q("stats").textContent = ""; q("fitbox").style.display = "none"; o.onChange(); return; }
+      const cmp = compareWithSimulation(ov.pts, o.getDaily(ov.seasonDays)), f = (v, d) => v == null || isNaN(v) ? "–" : v.toFixed(d);
+      let t = `${ov.series.nScenes} Sentinel-2 scene${ov.series.nScenes === 1 ? "" : "s"} found in the season, ${ov.pts.length} clear at this point.`;
+      if (ov.series.errors.length) t += ` ${ov.series.errors.length} could not be read (${ov.series.errors[0]}).`;
+      if (ov.pts.length >= 3) t += ` Simulated canopy vs NDVI: r = ${f(cmp.r, 2)}, RMSE = ${f(cmp.rmse, 3)}. Day each reaches 90% of its seasonal peak — simulated: ${f(cmp.fullSim, 0)}, NDVI: ${f(cmp.fullNdvi, 0)}.`;
+      else if (ov.pts.length) t += " Too few clear scenes for a comparison — try another year or check the coordinates.";
+      else t += " No usable observations — the point may be cloudy all season or outside coverage.";
+      q("stats").textContent = t;
+      q("fitbox").style.display = ov.pts.length >= 5 ? "" : "none";
+      o.onChange();
+    }
+    q("year").addEventListener("change", () => {
+      const y = q("year").value;
+      if (!y) { q("go").disabled = true; q("status").innerHTML = '<span class="status">Select a year to enable.</span>'; update(); return; }
+      const sow = document.getElementById("main-sowdate"), md = sow && /^\d{4}-\d{2}-\d{2}$/.test(sow.value) ? sow.value.slice(5) : "04-15";
+      q("start").value = `${y}-${md}`; q("end").value = isoAdd(q("start").value, Math.max(30, o.getSeasonDays()) - 1);
+      q("go").disabled = false; showLoc();
+      q("status").innerHTML = '<span class="status">Check the season dates, then fetch.</span>';
+      update();
+    });
+    ["start", "end"].forEach(k => q(k).addEventListener("change", update));
+    q("go").addEventListener("click", async () => {
+      const st = q("status"), start = q("start").value, end = q("end").value;
+      if (!start || !end || end <= start) { st.innerHTML = '<span class="status err">Enter a planting date and a later harvest date.</span>'; return; }
+      if (daysBetweenISO(start, end) > 400) { st.innerHTML = '<span class="status err">Season longer than 400 days — shorten it.</span>'; return; }
+      showLoc(); q("go").disabled = true;
+      try {
+        if (!satCache.has(keyNow())) {
+          st.innerHTML = '<span class="spinner"></span>Searching Sentinel-2 scenes…';
+          const series = await fetchSatelliteSeries(sharedLocation.lat, sharedLocation.lon, start, end, { evi: false, onProgress: (d, n) => { st.innerHTML = `<span class="spinner"></span>Reading scene ${Math.min(d + 1, n)} of ${n}…`; } });
+          satCache.set(keyNow(), series);
+        }
+        update();
+        st.innerHTML = '<span class="status ok">Done.</span>' + (+start.slice(0, 4) >= new Date().getFullYear() && end > new Date().toISOString().slice(0, 10) ? ' <span class="status">The season extends past today — later scenes are not available yet.</span>' : "");
+      } catch (e) { st.innerHTML = `<span class="status err">Couldn't get satellite data: ${e.message}</span>`; }
+      finally { q("go").disabled = false; }
+    });
+    q("fit").addEventListener("click", () => { const ov = overlay(); if (ov) { q("fitmsg").innerHTML = o.fit(ov.pts, ov.seasonDays); q("undo").disabled = false; } });
+    q("undo").addEventListener("click", () => { q("fitmsg").innerHTML = o.undo(); q("undo").disabled = true; });
+    return { overlay, update };
   }
 
   let reloadParametersForm = () => {};
@@ -3917,10 +4384,15 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
       renderPreview();
     }
 
+    function applyAdvLock() {
+      const unlocked = g("cal-adv-unlock").checked;
+      g("cal-adv-body").querySelectorAll("input").forEach(el => { el.disabled = !unlocked; });
+      toggleRateFields();
+    }
     function toggleRateFields() {
-      const auto = g("cal-autoRates").checked;
-      g("cal-CGC").disabled = auto;
-      g("cal-CDC").disabled = auto;
+      const auto = g("cal-autoRates").checked, locked = !g("cal-adv-unlock").checked;
+      g("cal-CGC").disabled = auto || locked;
+      g("cal-CDC").disabled = auto || locked;
       if (auto) {
         const c = getCropDef(cropSel.value);
         const rates = deriveCanopyRates(c);
@@ -3930,6 +4402,9 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
     }
 
     function updateStatus() {
+      const base = CROPS[cropSel.value], cur = getCropDef(cropSel.value);
+      const advChanged = ADV_FIELDS.some(f => (cur[f] == null ? null : cur[f]) !== (base[f] == null ? null : base[f]) && !((f === "CGC" || f === "CDC") && !cur.useManualRates)) || (!!cur.useManualRates !== !!base.useManualRates);
+      g("cal-adv-flag").innerHTML = advChanged ? '<span style="color:#d98a1c;">· modified from built-in values</span>' : "";
       g("cal-status").innerHTML = isCalibrated(cropSel.value)
         ? '<span class="status ok">Custom calibrated values — used everywhere this crop is selected.</span>'
         : '<span class="status">Showing built-in defaults.</span>';
@@ -3961,6 +4436,11 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
       renderPreview();
     }
 
+    let satPanel = null;
+    function previewDaily(nDays) {
+      const c = getCropDef(cropSel.value), rates = c.useManualRates ? { CGC: c.CGC, CDC: c.CDC } : deriveCanopyRates(c), pc = Object.assign({}, c, rates);
+      return Array.from({ length: nDays }, (_, i) => ({ day: i + 1, cc: canopyCoverBase(i + 1, pc) }));
+    }
     function renderPreview() {
       const c = getCropDef(cropSel.value);
       const rates = c.useManualRates ? { CGC: c.CGC, CDC: c.CDC } : deriveCanopyRates(c);
@@ -3968,10 +4448,17 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
       const nDays = c.cycle.maturity + 5;
       const data = [];
       for (let t = 1; t <= nDays; t++) data.push({ day: t, cc: canopyCoverBase(t, previewCrop) });
+      const ov = satPanel && satPanel.overlay();
+      if (ov && ov.pts.length) {
+        const n = Math.max(nDays, ov.seasonDays);
+        g("cal-preview-chart").innerHTML = ccNdviChart({ daily: previewDaily(n), pts: ov.pts, nDays: n });
+        return;
+      }
       g("cal-preview-chart").innerHTML = lineChart({ data, series: [{ key: "cc", color: "#7cab5a", area: true, label: "Canopy cover" }], nDays, yMax: 1.0, yFmt: v => (v * 100).toFixed(0) + "%" });
     }
 
-    cropSel.addEventListener("change", () => loadCropIntoForm(cropSel.value));
+    cropSel.addEventListener("change", () => { g("cal-adv-unlock").checked = false; loadCropIntoForm(cropSel.value); applyAdvLock(); });
+    g("cal-adv-unlock").addEventListener("change", applyAdvLock);
     function handleFieldChange(e) {
       if (!e.target.closest("fieldset")) return;
       if (e.target.id === "cal-autoRates") toggleRateFields();
@@ -3984,8 +4471,105 @@ if (typeof module !== "undefined") module.exports = { writeXLSX, zipStore, crc32
       loadCropIntoForm(cropSel.value);
     });
 
+    // ---- import / export of crop parameters ----
+    const ioMsg = (html) => { g("cal-io-status").innerHTML = html; };
+    g("cal-export").addEventListener("click", () => {
+      const k = cropSel.value;
+      downloadText(`crop_parameters_${k}.csv`, cropParamsCSV([k]));
+      ioMsg(`<span class="status ok">Exported ${CROPS[k].label}${isCalibrated(k) ? " (with your custom values)" : " (built-in values)"}.</span>`);
+    });
+    g("cal-export-all").addEventListener("click", () => {
+      const ks = Object.keys(cropOverrides);
+      if (!ks.length) { ioMsg('<span class="status">No crop has custom values yet — nothing to export. Use "Export this crop" for a built-in crop.</span>'); return; }
+      downloadText("crop_parameters_customised.csv", cropParamsCSV(ks));
+      ioMsg(`<span class="status ok">Exported ${ks.length} customised crop${ks.length > 1 ? "s" : ""}.</span>`);
+    });
+    g("cal-import").addEventListener("click", () => g("cal-import-file").click());
+    g("cal-import-file").addEventListener("change", async () => {
+      const files = [...(g("cal-import-file").files || [])]; if (!files.length) return;
+      const loaded = [], warns = [], errs = [];
+      for (const f of files) {
+        try {
+          const rows = await readTableFile(f);
+          const { patches, warns: w } = parseCropParamRows(rows);
+          warns.push(...w);
+          Object.keys(patches).forEach(k => { setCropOverride(k, patches[k]); if (!loaded.includes(k)) loaded.push(k); });
+          if (!Object.keys(patches).length) errs.push(`${f.name}: no recognised crop rows`);
+        } catch (e) { errs.push(`${f.name}: ${e.message}`); }
+      }
+      if (loaded.length) {
+        cropSel.value = loaded[0]; g("cal-adv-unlock").checked = false;
+        loadCropIntoForm(loaded[0]); applyAdvLock();
+        loaded.forEach(refreshStageFieldsFor);
+      }
+      ioMsg((loaded.length ? `<span class="status ok">Loaded ${loaded.map(k => CROPS[k].label).join(", ")}.</span> ` : "") + warns.map(w => `<span class="status">${w}</span>`).join(" ") + errs.map(e => `<span class="status err">${e}</span>`).join(" "));
+      g("cal-import-file").value = "";
+    });
+
+    let fitUndo = null;
+    function fitToNDVI(pts0, seasonDays) {
+      const key = cropSel.value, c0 = getCropDef(key), prevOverride = cropOverrides[key] ? Object.assign({}, cropOverrides[key]) : null;
+      const rates0 = c0.useManualRates ? { CGC: c0.CGC, CDC: c0.CDC } : deriveCanopyRates(c0);
+      // CC0 and CCx stay as they are. NDVI is rescaled onto that range (its seasonal minimum → CC0, its peak → CCx),
+      // so only the shape / timing of the season is taken from the satellite.
+      const med3 = (i) => { const w = [pts0[Math.max(i - 1, 0)].ndvi, pts0[i].ndvi, pts0[Math.min(i + 1, pts0.length - 1)].ndvi].sort((a, b) => a - b); return w[1]; };
+      const sm = pts0.map((p, i) => med3(i)), nMin = Math.min(...sm), nMax = Math.max(...sm);
+      if (nMax - nMin < 0.15) return '<span class="status err">NDVI hardly changes over this season (range &lt; 0.15) — there is no growth pattern to follow. Check the coordinates and season dates.</span>';
+      const pts = pts0.map(p => ({ day: p.day, ndvi: p.ndvi, t: Math.min(Math.max(c0.CCo + (p.ndvi - nMin) / (nMax - nMin) * (c0.CCx - c0.CCo), 0), c0.CCx) }));
+      const mk = x => Object.assign({}, c0, { CGC: x[0], CDC: x[1], cycle: Object.assign({}, c0.cycle, { senescStart: x[2] }) });
+      // Truncated-quadratic loss: points that miss by more than ~0.2 CC (a cloud-contaminated scene that slipped
+      // through the mask) stop pulling on the fit, so the curve follows the majority pattern.
+      const CAP = 0.2 * c0.CCx;
+      const huber = (ps) => x => {
+        if (x[0] < 0.01 || x[0] > 0.5 || x[1] < 0.005 || x[1] > 0.5 || x[2] < 15 || x[2] > seasonDays) return 1e6;
+        const m = mk(x); return ps.reduce((a, p) => { const e = Math.abs(canopyCoverBase(p.day, m) - p.t); return a + Math.min(e * e, CAP * CAP); }, 0);
+      };
+      let used = pts;
+      const sq = x => { const m = mk(x); return used.reduce((a, p) => a + (canopyCoverBase(p.day, m) - p.t) ** 2, 0); };
+      const pk = pts.reduce((b, p) => p.t > b.t ? p : b, pts[0]).day;
+      const after = pts.filter(p => p.day > pk && p.t < 0.9 * c0.CCx)[0];
+      const starts = [c0.cycle.senescStart, after ? after.day - 5 : seasonDays * 0.7, pk + 15, seasonDays * 0.6].map(v => Math.min(Math.max(v, 20), seasonDays - 1));
+      const search = ps => {
+        let bst = null;
+        starts.forEach(ts => [0.05, 0.12, rates0.CGC].forEach(cg => {
+          const x0 = [Math.min(Math.max(cg, 0.02), 0.45), Math.min(Math.max(rates0.CDC, 0.01), 0.45), ts];
+          const r = nelderMead(huber(ps), x0, [0.02, 0.02, 8], 600);
+          if (!bst || r.f < bst.f) bst = r;
+        }));
+        return bst;
+      };
+      let best = search(pts), nOut = 0;
+      // second pass: plain least squares on the points the first fit explains (within the cap)
+      const res = pts.map(p => Math.abs(canopyCoverBase(p.day, mk(best.x)) - p.t));
+      const keep = pts.filter((p, i) => res[i] <= CAP);
+      if (keep.length < pts.length && keep.length >= 5) {
+        nOut = pts.length - keep.length;
+        const lsq = ps => x => { if (x[0] < 0.01 || x[0] > 0.5 || x[1] < 0.005 || x[1] > 0.5 || x[2] < 15 || x[2] > seasonDays) return 1e6; const m = mk(x); return ps.reduce((a, p) => a + (canopyCoverBase(p.day, m) - p.t) ** 2, 0); };
+        const r2 = nelderMead(lsq(keep), best.x, [0.01, 0.01, 4], 600); if (r2.f <= lsq(keep)(best.x)) best = r2;
+      }
+      used = nOut ? keep : pts;
+      const x = best.x, rmse = v => Math.sqrt(v / used.length), before = sq([rates0.CGC, rates0.CDC, c0.cycle.senescStart]);
+      const m = mk(x);
+      // full-canopy day: first day the fitted canopy reaches 98% of CCx (kept between emergence and senescence)
+      let tMax = 1; while (tMax < x[2] && canopyGrowthPhase(tMax, m) < 0.98 * c0.CCx) tMax++;
+      const cyc = Object.assign({}, c0.cycle, { senescStart: Math.round(x[2]), maxCanopy: Math.min(Math.max(tMax, c0.cycle.emergence + 1), Math.round(x[2]) - 1) });
+      cyc.maturity = Math.max(cyc.maturity, cyc.senescStart + 1);
+      fitUndo = { key, prevOverride };
+      setCropOverride(key, { CGC: +x[0].toFixed(4), CDC: +x[1].toFixed(4), useManualRates: true, cycle: cyc });
+      loadCropIntoForm(key); applyAdvLock(); refreshStageFieldsFor(key);
+      return `<span class="status ok">Season pattern adjusted (CC₀ ${c0.CCo} and CCx ${c0.CCx} unchanged): CGC ${rates0.CGC.toFixed(3)} → ${x[0].toFixed(3)}, CDC ${rates0.CDC.toFixed(3)} → ${x[1].toFixed(3)}, full canopy day ${c0.cycle.maxCanopy} → ${cyc.maxCanopy}, senescence starts day ${c0.cycle.senescStart} → ${cyc.senescStart}. RMSE vs rescaled NDVI ${rmse(before).toFixed(3)} → ${rmse(sq(x)).toFixed(3)}${nOut ? ` (${nOut} outlying scene${nOut > 1 ? "s" : ""} ignored in the fit)` : ""}. Applied to the crop everywhere; the Advanced section shows the rates as modified.</span>`;
+    }
+    function undoFit() {
+      if (!fitUndo) return "";
+      const { key, prevOverride } = fitUndo; fitUndo = null;
+      if (prevOverride) { cropOverrides[key] = prevOverride; cropOverrideListeners.forEach(fn => fn(key)); } else clearCropOverride(key);
+      cropSel.value = key; loadCropIntoForm(key); applyAdvLock(); refreshStageFieldsFor(key);
+      return '<span class="status">Previous canopy values restored.</span>';
+    }
+    satPanel = mountSeasonSatellite(g("cal-sat"), { getDaily: previewDaily, getSeasonDays: () => getCropDef(cropSel.value).cycle.maturity, onChange: () => renderPreview(), fit: fitToNDVI, undo: undoFit });
     loadCropIntoForm(cropSel.value);
-    reloadParametersForm = () => loadCropIntoForm(cropSel.value);
+    applyAdvLock();
+    reloadParametersForm = () => { loadCropIntoForm(cropSel.value); applyAdvLock(); };
   }
 
   // ---------------------------------------------------------------
@@ -4364,7 +4948,7 @@ date,cc_percent,biomass_t_ha
         const stageDays = {};
         STAGE_INPUTS.forEach(([k]) => { const v = g("st-" + k).value; stageDays[k] = v ? daysBetweenISO(planting, v) + 1 : null; if (stageDays[k] != null && (stageDays[k] < 1 || stageDays[k] > nDays + 60)) throw new Error(`${label}: ${k} date is outside the season`); });
         const yv = parseFloat(g("yield").value);
-        runs.push({ id, label, planting, harvest, nDays, weather, events, soil: SOILS[g("soil").value], soilKey: g("soil").value,
+        runs.push({ id, label, planting, harvest, lat: parseFloat(g("lat").value), lon: parseFloat(g("lon").value), nDays, weather, events, soil: SOILS[g("soil").value], soilKey: g("soil").value,
           stageDays, yield: isNaN(yv) ? null : yv, yieldBasis: g("ybasis").value || defBasis, extra: readExtra(g("extra").value, planting), validation: g("hold").checked, irrMode });
       }
       return runs;
@@ -4406,7 +4990,7 @@ date,cc_percent,biomass_t_ha
         } else if (!pheno) throw new Error("nothing to calibrate — give each year a yield and/or observed stage dates");
         const patch = Object.assign({}, res ? res.patch : {});
         if (pheno) { patch.cycle = pheno.cycle; if (pheno.gddCycle) { patch.gddCycle = pheno.gddCycle; patch.Tbase = pheno.Tbase; } }
-        lastRun = { cropKey, crop0, patch, pheno, res, years: runs.map(r => r.label) };
+        lastRun = { cropKey, crop0, patch, pheno, res, years: runs.map(r => r.label), meta: runs.map(r => ({ label: r.label, lat: r.lat, lon: r.lon, sowDate: r.planting })) };
         renderCalibrationResults($("cal2-results"), lastRun, notes);
         statusEl.innerHTML = `<span class="status ok">Calibration finished.</span>`;
       } catch (e) {
@@ -4506,6 +5090,8 @@ date,cc_percent,biomass_t_ha
     <h2>How this model works</h2>
     <p><strong>AquaCrop-Web</strong> is an independent, browser-based re-implementation of the core conceptual model behind FAO's AquaCrop — <em>canopy cover as the driver of transpiration, water-driven biomass accumulation, and a harvest index that responds to water stress at different growth stages</em>. It follows the published equations and logic of Steduto, Raes, Hsiao &amp; Fereres (2009, <em>Agronomy Journal</em> 101:426–437, and companion Papers II–IV) and the FAO Irrigation &amp; Drainage Paper 66 reference manual, but it is <strong>not</strong> the official FAO AquaCrop software and does not read or write AquaCrop's native project files. For the authoritative, fully validated model — including salinity, CO₂ response, multi-year perennials and field-calibrated crop files — use the official release at the <a href="https://github.com/un-fao/fao-AquaCrop" target="_blank" rel="noopener">un-fao/fao-AquaCrop</a> repository.</p>
 
+    <h3>Parameter groups and the satellite check</h3>
+    <p>On the <strong>Parameters</strong> tab, cultivar- and management-dependent values (stage timing, CC₀, CCx, root depth, HI₀) are edited directly. The <em>conservative</em> parameters — WP*, canopy growth/decline rates, Kcb, harvest-index stress effects and the water-stress thresholds — sit in a collapsed Advanced section that stays locked until you confirm; change them only with values calibrated under real, controlled field conditions. Any crop can be exported to, and re-imported from, a small CSV (<code>crop, parameter, value</code>). When a simulation runs, NDVI for the simulated season is fetched automatically and added to the Results canopy-cover chart on a second (right) axis. In the canopy development review on the Parameters tab, the <strong>satellite check</strong> (choose a growing-season year) downloads Sentinel-2 L2A reflectance from the free Earth Search STAC catalogue (AWS Open Data), masks clouds/shadows with the scene classification layer, averages the reflectances over a 3×3-pixel window at the field coordinates and computes NDVI = (NIR−Red)/(NIR+Red). NDVI is plotted on the canopy preview as a plausibility check of timing and shape, and an optional button keeps CC₀ and CCx and refits CGC, CDC and the senescence timing so the season follows the NDVI pattern (NDVI rescaled onto the CC range); NDVI is a vegetation index, not canopy cover (it includes soil background and saturates at high cover), so treat the fit as a starting point.</p>
     <h3>Canopy cover (CC)</h3>
     <p>Canopy cover grows from an initial value CC₀ through an exponential phase, transitions to a logistic phase as it approaches CCx, then declines exponentially after the onset of senescence:</p>
     <div class="eq">Growth (CC ≤ CCx/2):   CC(t) = CC₀ · exp(CGC·t)
@@ -4517,7 +5103,7 @@ Decline:                 CC(t) = CCx · [1 − 0.05·(exp(CDC·(t−t_sen)/CCx) 
     <p>By default every growth-stage threshold (emergence, max canopy, senescence, flowering, maturity) is a fixed number of calendar days after sowing — simple, but it means the same crop grows at the same pace regardless of how warm or cool the season actually is. Each scenario can instead be switched to <strong>growing degree-days (GDD)</strong>: the same thresholds are reinterpreted as accumulated heat units rather than day counts, and the crop moves through its growth stages as fast as the weather allows.</p>
     <div class="eq">GDD(day) = (min(Tmax,T_upper) + max(Tmin,T_base)) / 2 − T_base,  floored at 0
 Accumulated GDD = Σ GDD(day)  since sowing</div>
-    <p>In GDD mode the canopy, root-growth, senescence, flowering and harvest-index equations above all run on accumulated GDD instead of elapsed days — a cool spell simply slows the crop down, a heat wave speeds it up. Everything else (irrigation scheduling by fixed calendar dates, the Kcb ageing decline, and the water balance itself) still runs on the literal calendar-day loop, since those aren't phenological in the same sense. GDD mode needs daily Tmax/Tmin, which NASA POWER always supplies; an uploaded CSV needs optional <code>tmax,tmin</code> columns for it — without them, no heat units accrue and the crop won't develop. Switching a scenario to GDD mode converts its stage-length defaults using a rough ~24°C seasonal-average heuristic as a starting point; edit them to match real GDD requirements for your crop and cultivar once you have better numbers.</p>
+    <p>In GDD mode the canopy, root-growth, senescence, flowering and harvest-index equations above all run on accumulated GDD instead of elapsed days — a cool spell simply slows the crop down, a heat wave speeds it up. Everything else (irrigation scheduling by fixed calendar dates, the Kcb ageing decline, and the water balance itself) still runs on the literal calendar-day loop, since those aren't phenological in the same sense. GDD mode needs daily Tmax/Tmin, which NASA POWER always supplies; an uploaded CSV needs optional <code>tmax,tmin</code> columns for it — without them, no heat units accrue and the crop won't develop. Stage timing is no longer entered in the scenario: it is read from the crop's Parameters tab (days, or the GDD column in GDD mode). Where no GDD thresholds are stored, the day values are converted with a rough ~24°C seasonal-average heuristic; enter real GDD requirements, or calibrate them, on the Parameters tab.</p>
     <h3>Importing schedules and calibrating from field data</h3>
     <p>A fixed irrigation calendar can be imported from an .xlsx or .csv file (first worksheet) with a <code>day</code> or <code>date</code> column and a depth column; dates are converted to days after sowing from the scenario's sowing date.</p>
     <p>The <strong>Calibration</strong> tab takes field data for one or several years (one sub-tab each, or one season file per year): coordinates or an imported climate file, planting and harvest dates, soil, irrigation dates and depths, measured yield, observed phenological stage dates and, optionally, canopy cover and biomass. Calibration has two parts. <em>Phenology:</em> the observed stage dates give mean stage lengths in calendar days; if daily Tmax/Tmin are available, the base temperature is chosen to minimise the timing error of the accumulated-GDD model across years (relative GDD spread at each stage × its mean day count) and the GDD thresholds are the mean accumulated GDD at the observed dates. <em>Yield and biomass:</em> each year is simulated with its own climate, soil, irrigation and observed stage timing, and the parameters are fitted by re-running the full daily water balance: if canopy points are given, a Nelder–Mead search over CCx, CGC and CDC minimises canopy-cover error; because simulated biomass is exactly proportional to WP*, WP* is rescaled by least squares to match any biomass data; and HI₀ is solved (golden-section search) so that simulated yields match the observed yields across the fitting years (for forage crops, WP* is rescaled instead). Years can be held out for validation. Optionally p<sub>exp</sub> and p<sub>sto</sub> are fitted jointly with HI₀ when the years differ in water stress. Without biomass data, WP* and HI₀ are confounded (yield depends on their product); a few biomass samples in one year resolve it. All the data entered (settings, years, dates, soil, irrigation, yield, stage dates, climate and observations) can be exported to, and re-imported from, one workbook or sectioned CSV file. A single button then pushes the results to the Parameters tab and can export them as a CSV file. Parameters calibrated on a few years at one site may not transfer — validate on a held-out year where possible.</p>
