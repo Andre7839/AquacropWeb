@@ -2918,7 +2918,8 @@ async function sampleScene(item, lat, lon, opts) {
   if (n < Math.ceil(R.length / 2)) return null;
   const r = sr / n, nn = sn / n, ndvi = (nn - r) / (nn + r);
   if (!(ndvi >= -1 && ndvi <= 1)) return null;
-  return { date: String(item.properties.datetime).slice(0, 10), ndvi, cloud: item.properties["eo:cloud_cover"], nPx: n };
+  const evi = 2.5 * (nn - r) / (nn + 2.4 * r + 1);                                  // EVI2 (two-band EVI, no blue band needed)
+  return { date: String(item.properties.datetime).slice(0, 10), ndvi, evi, cloud: item.properties["eo:cloud_cover"], nPx: n };
 }
 // Whole season: [{date, ndvi}] sorted by date. onProgress(done, total, note)
 async function fetchSatelliteSeries(lat, lon, startISO, endISO, opts) {
@@ -2970,7 +2971,7 @@ function compareWithSimulation(pts, daily) {
   };
 }
 // SVG: simulated canopy cover (area + line) with the NDVI observations on the same 0–1 axis
-function satelliteChart({ daily, pts, nDays }) {
+function satelliteChart({ daily, pts, nDays, label }) {
   const yMax = 1, col = "#e8b04a";
   let svg = `<svg class="chart" viewBox="0 0 ${CHART_W} ${CHART_H}" xmlns="http://www.w3.org/2000/svg">`;
   svg += axesSVG(nDays, yMax, v => v.toFixed(1), null, "days after sowing");
@@ -2980,7 +2981,7 @@ function satelliteChart({ daily, pts, nDays }) {
   if (v.length > 1) svg += `<path d="${v.map((p, i) => (i ? "L" : "M") + scaleX(p.day, nDays).toFixed(1) + " " + scaleY(Math.max(0, p.ndvi), yMax).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>`;
   v.forEach(p => {
     const x = scaleX(p.day, nDays), y = scaleY(Math.max(0, p.ndvi), yMax), sim = daily.find(r => r.day === p.day);
-    const rows = [{ label: "NDVI", value: p.ndvi.toFixed(2), color: col }];
+    const rows = [{ label: label || "NDVI", value: p.ndvi.toFixed(2), color: col }];
     if (sim) rows.push({ label: "Simulated CC", value: sim.cc.toFixed(2), color: "#7cab5a" });
     svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" fill="${col}" stroke="#fff" stroke-width="1.2"/><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent" pointer-events="all" data-tip='${tipHTML(p.date + " · day " + p.day, rows)}'/>`;
   });
@@ -2988,7 +2989,7 @@ function satelliteChart({ daily, pts, nDays }) {
 }
 
 // Canopy-cover chart for the Results tab: simulated CC on the left axis (%), NDVI observations on a right (Y2) axis (0–1)
-function ccNdviChart({ daily, pts, nDays }) {
+function ccNdviChart({ daily, pts, nDays, label }) {
   const yMax = 1, col = "#e8b04a", W = CHART_W + 40;
   let svg = `<svg class="chart" viewBox="0 0 ${W} ${CHART_H}" xmlns="http://www.w3.org/2000/svg">`;
   svg += axesSVG(nDays, yMax, v => (v * 100).toFixed(0) + "%", null, "days after sowing");
@@ -3000,12 +3001,12 @@ function ccNdviChart({ daily, pts, nDays }) {
     const v = i / 4, y = scaleY(v, yMax);
     svg += `<line x1="${x2}" y1="${y.toFixed(1)}" x2="${x2 + 4}" y2="${y.toFixed(1)}" stroke="${col}"/><text x="${x2 + 7}" y="${(y + 3).toFixed(1)}" font-size="9" fill="${col}" font-family="var(--font-mono)">${v.toFixed(2)}</text>`;
   }
-  svg += `<text transform="translate(${W - 3} ${(PAD_T + CHART_H - PAD_B) / 2}) rotate(-90)" text-anchor="middle" font-size="9" fill="${col}">NDVI (Sentinel-2)</text>`;
+  svg += `<text transform="translate(${W - 3} ${(PAD_T + CHART_H - PAD_B) / 2}) rotate(-90)" text-anchor="middle" font-size="9" fill="${col}">${label || "NDVI"} (Sentinel-2)</text>`;
   const v = pts.filter(p => isFinite(p.ndvi) && p.day >= 1 && p.day <= nDays);
   if (v.length > 1) svg += `<path d="${v.map((p, i) => (i ? "L" : "M") + scaleX(p.day, nDays).toFixed(1) + " " + scaleY(Math.max(0, p.ndvi), yMax).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>`;
   v.forEach(p => {
     const x = scaleX(p.day, nDays), y = scaleY(Math.max(0, p.ndvi), yMax), sim = daily.find(r => r.day === p.day);
-    const rows = [{ label: "NDVI", value: p.ndvi.toFixed(2), color: col }];
+    const rows = [{ label: label || "NDVI", value: p.ndvi.toFixed(2), color: col }];
     if (sim) rows.push({ label: "Simulated CC", value: (sim.cc * 100).toFixed(0) + "%", color: "#7cab5a" });
     svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" fill="${col}" stroke="#fff" stroke-width="1.2"/><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent" pointer-events="all" data-tip='${tipHTML(p.date + " · day " + p.day, rows)}'/>`;
   });
@@ -3728,6 +3729,15 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     return `<div class="readout-grid">` + items.map(i => `<div class="readout-item"><span class="lbl">${i[0]}</span><span class="val">${i[1]}</span></div>`).join("") + `</div>`;
   }
 
+  // Vegetation index used for the satellite overlay: "ndvi" or "evi" (EVI2, two-band). Both are stored per scene.
+  let satIndex = "ndvi";
+  document.addEventListener("change", e => { const el = e.target; if (el && el.tagName === "SELECT" && /-idx$/.test(el.id)) setSatIndex(el.value); });
+  const idxLabel = () => satIndex === "evi" ? "EVI" : "NDVI";
+  const withIdx = (pts) => pts.map(p => Object.assign({}, p, { ndvi: satIndex === "evi" ? p.evi : p.ndvi })).filter(p => isFinite(p.ndvi));
+  const idxSelectHTML = (id) => `<select id="${id}" style="width:auto;display:inline-block;padding:2px 6px;font-size:12px" title="Vegetation index shown against the simulated canopy"><option value="ndvi"${satIndex === "ndvi" ? " selected" : ""}>NDVI</option><option value="evi"${satIndex === "evi" ? " selected" : ""}>EVI (EVI2)</option></select>`;
+  const idxListeners = [];
+  function setSatIndex(v) { satIndex = v; idxListeners.forEach(f => { try { f(); } catch (e) {} }); }
+
   // NDVI for the simulated season, fetched in the background and added to the canopy chart on a second (right) axis
   async function attachNdviToResults(idPrefix, scn, daily) {
     const chartEl = document.getElementById(`${idPrefix}-cc-chart`), st = document.getElementById(`${idPrefix}-ndvi-status`);
@@ -3735,15 +3745,17 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     const nDays = daily.length, start = scn.sowDate, end = isoAdd(start, nDays - 1), key = [scn.lat, scn.lon, start, end].join("|");
     const stale = () => document.getElementById(`${idPrefix}-cc-chart`) !== chartEl;
     const draw = (series) => {
-      const pts = series.points.map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= nDays);
-      if (pts.length) chartEl.innerHTML = ccNdviChart({ daily, pts, nDays });
+      const pts = withIdx(series.points).map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= nDays);
+      if (pts.length) chartEl.innerHTML = ccNdviChart({ daily, pts, nDays, label: idxLabel() });
+      const lg = document.getElementById(`${idPrefix}-ndvi-legend`); if (lg) lg.textContent = `Sentinel-2 ${idxLabel()} (right axis, Y2)`;
       const cmp = compareWithSimulation(pts, daily), f = (v, d) => v == null || isNaN(v) ? "–" : v.toFixed(d);
-      let t = `NDVI for ${start} → ${end} at ${scn.lat.toFixed(3)}, ${scn.lon.toFixed(3)}: ${series.nScenes} Sentinel-2 scene${series.nScenes === 1 ? "" : "s"} found, ${pts.length} clear.`;
+      let t = `${idxLabel()} for ${start} → ${end} at ${scn.lat.toFixed(3)}, ${scn.lon.toFixed(3)}: ${series.nScenes} Sentinel-2 scene${series.nScenes === 1 ? "" : "s"} found, ${pts.length} clear.`;
       if (series.errors.length) t += ` ${series.errors.length} could not be read.`;
-      if (pts.length >= 3) t += ` Simulated canopy vs NDVI: r = ${f(cmp.r, 2)}. NDVI is an index, not canopy cover — compare timing and shape.`;
+      if (pts.length >= 3) t += ` Simulated canopy vs ${idxLabel()}: r = ${f(cmp.r, 2)}. ${idxLabel()} is an index, not canopy cover — compare timing and shape.`;
       else if (!pts.length) t += " No usable observations, so none are plotted.";
       st.textContent = t;
     };
+    idxListeners.push(() => { if (!stale() && satCache.has(key)) draw(satCache.get(key)); });
     if (satCache.has(key)) { draw(satCache.get(key)); return; }
     if (start > new Date().toISOString().slice(0, 10)) { st.textContent = "NDVI not available: the simulated season starts in the future."; return; }
     st.innerHTML = '<span class="spinner"></span>Fetching Sentinel-2 NDVI for the simulated season…';
@@ -3767,7 +3779,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     html += `<div class="panel"><h2>Canopy cover &amp; root development</h2>
       <div class="chartwrap"><h3>Canopy cover over the season</h3>
         <div id="${idPrefix}-cc-chart"></div>
-        <div class="legend"><span><span class="sw" style="background:var(--canopy-400)"></span>Canopy cover (fraction of ground shaded, left axis)</span><span><span class="sw" style="background:#e8b04a"></span>Sentinel-2 NDVI (right axis, Y2)</span></div>
+        <div class="legend"><span><span class="sw" style="background:var(--canopy-400)"></span>Canopy cover (fraction of ground shaded, left axis)</span><span><span class="sw" style="background:#e8b04a"></span><span id="${idPrefix}-ndvi-legend">Sentinel-2 NDVI (right axis, Y2)</span> ${idxSelectHTML(idPrefix + "-idx")}</span></div>
         <div class="hint" id="${idPrefix}-ndvi-status"></div>
       </div></div>`;
 
@@ -4292,7 +4304,8 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       </div>
       <div class="hint" data-sat="loc"></div>
       <div class="btnrow" style="align-items:center;gap:10px;flex-wrap:wrap;">
-        <button class="btn secondary" data-sat="go" disabled>2 · Fetch NDVI</button>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:6px">Index ${idxSelectHTML("cal-sat-idx")}</label>
+        <button class="btn secondary" data-sat="go" disabled>2 · Fetch satellite data</button>
         <span data-sat="status"><span class="status">Select a year to enable.</span></span>
       </div>
       <div class="hint" data-sat="stats"></div>
@@ -4300,7 +4313,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
         <strong>3 · Adjust the growing-season pattern to the NDVI</strong>
         <div class="hint" style="margin:6px 0;">Keeps the canopy-cover range (CC₀ and CCx) exactly as set above and assumes canopy cover is proportional to NDVI: the season's NDVI is rescaled onto that range and the growth coefficient (CGC), decline coefficient (CDC), full-canopy day and senescence start are refitted so the curve follows the NDVI pattern in time. NDVI also sees soil background and saturates when the canopy is dense, so the shape is more reliable than any single value — check it against more than one season.</div>
         <div class="btnrow" style="align-items:center;gap:10px;flex-wrap:wrap;">
-          <button class="btn" data-sat="fit">Adjust season pattern to NDVI</button>
+          <button class="btn" data-sat="fit">Adjust season pattern to index</button>
           <button class="btn ghost" data-sat="undo" disabled>Undo adjustment</button>
           <span data-sat="fitmsg"></span>
         </div>
@@ -4313,7 +4326,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     function overlay() {
       const series = satCache.get(keyNow()); if (!series || !q("start").value || !q("end").value) return null;
       const start = q("start").value, seasonDays = daysBetweenISO(start, q("end").value) + 1;
-      const pts = series.points.map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= seasonDays);
+      const pts = withIdx(series.points).map(p => Object.assign({}, p, { day: daysBetweenISO(start, p.date) + 1 })).filter(p => p.day >= 1 && p.day <= seasonDays);
       return { pts, seasonDays, series };
     }
     function update() {
@@ -4322,7 +4335,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       const cmp = compareWithSimulation(ov.pts, o.getDaily(ov.seasonDays)), f = (v, d) => v == null || isNaN(v) ? "–" : v.toFixed(d);
       let t = `${ov.series.nScenes} Sentinel-2 scene${ov.series.nScenes === 1 ? "" : "s"} found in the season, ${ov.pts.length} clear at this point.`;
       if (ov.series.errors.length) t += ` ${ov.series.errors.length} could not be read (${ov.series.errors[0]}).`;
-      if (ov.pts.length >= 3) t += ` Simulated canopy vs NDVI: r = ${f(cmp.r, 2)}, RMSE = ${f(cmp.rmse, 3)}. Day each reaches 90% of its seasonal peak — simulated: ${f(cmp.fullSim, 0)}, NDVI: ${f(cmp.fullNdvi, 0)}.`;
+      if (ov.pts.length >= 3) t += ` Simulated canopy vs ${idxLabel()}: r = ${f(cmp.r, 2)}, RMSE = ${f(cmp.rmse, 3)}. Day each reaches 90% of its seasonal peak — simulated: ${f(cmp.fullSim, 0)}, ${idxLabel()}: ${f(cmp.fullNdvi, 0)}.`;
       else if (ov.pts.length) t += " Too few clear scenes for a comparison — try another year or check the coordinates.";
       else t += " No usable observations — the point may be cloudy all season or outside coverage.";
       q("stats").textContent = t;
@@ -4347,7 +4360,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       try {
         if (!satCache.has(keyNow())) {
           st.innerHTML = '<span class="spinner"></span>Searching Sentinel-2 scenes…';
-          const series = await fetchSatelliteSeries(sharedLocation.lat, sharedLocation.lon, start, end, { evi: false, onProgress: (d, n) => { st.innerHTML = `<span class="spinner"></span>Reading scene ${Math.min(d + 1, n)} of ${n}…`; } });
+          const series = await fetchSatelliteSeries(sharedLocation.lat, sharedLocation.lon, start, end, { onProgress: (d, n) => { st.innerHTML = `<span class="spinner"></span>Reading scene ${Math.min(d + 1, n)} of ${n}…`; } });
           satCache.set(keyNow(), series);
         }
         update();
@@ -4357,6 +4370,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     });
     q("fit").addEventListener("click", () => { const ov = overlay(); if (ov) { q("fitmsg").innerHTML = o.fit(ov.pts, ov.seasonDays); q("undo").disabled = false; } });
     q("undo").addEventListener("click", () => { q("fitmsg").innerHTML = o.undo(); q("undo").disabled = true; });
+    idxListeners.push(() => { const s = host.querySelector("#cal-sat-idx"); if (s) s.value = satIndex; if (host.isConnected) update(); });
     return { overlay, update };
   }
 
@@ -4453,7 +4467,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       const ov = satPanel && satPanel.overlay();
       if (ov && ov.pts.length) {
         const n = Math.max(nDays, ov.seasonDays);
-        g("cal-preview-chart").innerHTML = ccNdviChart({ daily: previewDaily(n), pts: ov.pts, nDays: n });
+        g("cal-preview-chart").innerHTML = ccNdviChart({ daily: previewDaily(n), pts: ov.pts, nDays: n, label: idxLabel() });
         return;
       }
       g("cal-preview-chart").innerHTML = lineChart({ data, series: [{ key: "cc", color: "#7cab5a", area: true, label: "Canopy cover" }], nDays, yMax: 1.0, yFmt: v => (v * 100).toFixed(0) + "%" });
