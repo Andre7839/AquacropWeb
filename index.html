@@ -2905,13 +2905,15 @@ async function sampleScene(item, lat, lon, opts) {
   // Average the surface reflectances over the window first, then form NDVI from the means.
   // (A ratio of per-pixel values blows up when one dark / shadowed / over-corrected pixel has a reflectance
   // at or below zero — that is what produced NDVI > 1.) Pixels with non-physical reflectance are skipped.
-  const MINR = 0.002;
+  const MINR = 0.002, RED_FLOOR = 0.02;
   let sr = 0, sn = 0, n = 0;
   for (let i = 0; i < R.length; i++) {
     if (!(R[i] > 0) || !(N[i] > 0)) continue;                                     // nodata / outside the image
     const r = R[i] * red.g.scale + red.g.offset, nn = N[i] * nir.g.scale + nir.g.offset;
-    if (r < MINR || nn < MINR || r > 1.2 || nn > 1.2) continue;
-    sr += r; sn += nn; n++;
+    if (nn < MINR || r > 1.2 || nn > 1.2) continue;   // very low / negative red is kept and floored below
+    // Sen2Cor over-subtracts the atmospheric path over dense green canopy (red ≈ 0.00–0.01, blue < 0), which pushes
+    // NDVI to 0.97+. Dense healthy vegetation has red ≥ ~0.02–0.03, so the red reflectance is floored at RED_FLOOR.
+    sr += Math.max(r, RED_FLOOR); sn += nn; n++;
   }
   if (n < Math.ceil(R.length / 2)) return null;
   const r = sr / n, nn = sn / n, ndvi = (nn - r) / (nn + r);
