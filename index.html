@@ -3015,6 +3015,93 @@ function ccNdviChart({ daily, pts, nDays, label }) {
 
 if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, utmFromEPSG, openCOG, readWindow, searchSentinel2, sampleScene, fetchSatelliteSeries, assetGrid, pixelOf, pearson, firstReach, compareWithSimulation, satelliteChart, STAC_URL };
 
+// ============================================================================
+// SOIL FROM LOCATION — USDA SSURGO (Soil Data Access, US) with ISRIC SoilGrids 2.0 (global) as fallback.
+// Returns the 0–100 cm texture and maps it to the USDA texture class used by the SOILS table (AquaCrop's classes).
+// ============================================================================
+const SDA_URL = "https://sdmdataaccess.sc.egov.usda.gov/Tabular/post.rest";
+const SOILGRIDS_URL = "https://rest.isric.org/soilgrids/v2.0/properties/query";
+function usdaTexture(sand, silt, clay) {
+  const t = sand + silt + clay; if (!(t > 0)) return null;
+  sand = sand * 100 / t; silt = silt * 100 / t; clay = clay * 100 / t;
+  if (silt + 1.5 * clay < 15) return "sand";
+  if (silt + 1.5 * clay >= 15 && silt + 2 * clay < 30) return "loamysand";
+  if ((clay >= 7 && clay < 20 && sand > 52 && silt + 2 * clay >= 30) || (clay < 7 && silt < 50 && silt + 2 * clay >= 30)) return "sandyloam";
+  if (clay >= 7 && clay < 27 && silt >= 28 && silt < 50 && sand <= 52) return "loam";
+  if ((silt >= 50 && clay >= 12 && clay < 27) || (silt >= 50 && silt < 80 && clay < 12)) return "siltloam";
+  if (silt >= 80 && clay < 12) return "silt";
+  if (clay >= 20 && clay < 35 && silt < 28 && sand > 45) return "sandyclayloam";
+  if (clay >= 27 && clay < 40 && sand > 20 && sand <= 45) return "clayloam";
+  if (clay >= 27 && clay < 40 && sand <= 20) return "siltclayloam";
+  if (clay >= 35 && sand > 45) return "sandyclay";
+  if (clay >= 40 && silt >= 40) return "siltyclay";
+  if (clay >= 40 && sand <= 45 && silt < 40) return "clay";
+  return null;
+}
+// thickness-weighted mean over [0, maxD] of layers [{top, bot, sand, silt, clay}]
+function profileMean(layers, maxD) {
+  let ws = 0, s = 0, si = 0, c = 0;
+  layers.forEach(l => {
+    const a = Math.max(0, l.top), b = Math.min(maxD, l.bot), w = b - a;
+    if (w > 0 && isFinite(l.sand) && isFinite(l.silt) && isFinite(l.clay)) { ws += w; s += w * l.sand; si += w * l.silt; c += w * l.clay; }
+  });
+  return ws > 0 ? { sand: s / ws, silt: si / ws, clay: c / ws, depth: ws } : null;
+}
+async function fetchTimeout(url, opts, ms) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, Object.assign({}, opts, { signal: ctl.signal })); }
+  catch (e) { throw new Error(e.name === "AbortError" ? "the soil service took too long to answer" : e.message); }
+  finally { clearTimeout(t); }
+}
+async function soilFromSSURGO(lat, lon) {
+  const q = `SELECT c.compname, c.comppct_r, c.cokey, ch.hzdept_r, ch.hzdepb_r, ch.sandtotal_r, ch.silttotal_r, ch.claytotal_r ` +
+    `FROM mapunit mu INNER JOIN component c ON c.mukey = mu.mukey INNER JOIN chorizon ch ON ch.cokey = c.cokey ` +
+    `WHERE mu.mukey IN (SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT(${lon} ${lat})')) AND ch.hzdept_r < 100 ` +
+    `ORDER BY c.comppct_r DESC, c.cokey, ch.hzdept_r`;
+  const r = await fetchTimeout(SDA_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q, format: "JSON+COLUMNNAME" }) }, 20000);
+  if (!r.ok) throw new Error(`USDA Soil Data Access returned HTTP ${r.status}`);
+  const txt = await r.text(); if (!txt.trim()) return null;
+  const j = JSON.parse(txt), rows = (j.Table || []).slice(1); if (!rows.length) return null;
+  const comps = new Map();
+  rows.forEach(a => {
+    const k = a[2]; if (!comps.has(k)) comps.set(k, { name: a[0], pct: +a[1], layers: [] });
+    comps.get(k).layers.push({ top: +a[3], bot: +a[4], sand: parseFloat(a[5]), silt: parseFloat(a[6]), clay: parseFloat(a[7]) });
+  });
+  const list = [...comps.values()].map(c => Object.assign(c, { mean: profileMean(c.layers, 100) })).filter(c => c.mean && c.mean.depth >= 20);
+  if (!list.length) return null;
+  list.sort((a, b) => b.pct - a.pct);
+  const dom = list[0], tex = usdaTexture(dom.mean.sand, dom.mean.silt, dom.mean.clay);
+  if (!tex) return null;
+  return { source: "USDA SSURGO", key: tex, name: dom.name, pct: dom.pct, depth: dom.mean.depth, sand: dom.mean.sand, silt: dom.mean.silt, clay: dom.mean.clay };
+}
+async function soilFromSoilGrids(lat, lon) {
+  const url = `${SOILGRIDS_URL}?lon=${lon}&lat=${lat}&property=sand&property=silt&property=clay&depth=0-5cm&depth=5-15cm&depth=15-30cm&depth=30-60cm&depth=60-100cm&value=mean`;
+  const r = await fetchTimeout(url, {}, 45000);
+  if (!r.ok) throw new Error(`ISRIC SoilGrids returned HTTP ${r.status}`);
+  const j = await r.json(), by = {};
+  ((j.properties || {}).layers || []).forEach(L => { const f = (L.unit_measure && L.unit_measure.d_factor) || 10; (L.depths || []).forEach(d => {
+    const k = d.range.top_depth + "-" + d.range.bottom_depth; by[k] = by[k] || { top: d.range.top_depth, bot: d.range.bottom_depth };
+    const v = d.values && d.values.mean; by[k][L.name] = v == null ? NaN : v / f;  // SoilGrids sand/silt/clay: mapped g/kg, d_factor 10 → %
+  }); });
+  const layers = Object.values(by).map(l => ({ top: l.top, bot: l.bot, sand: l.sand, silt: l.silt, clay: l.clay }));
+  const m = profileMean(layers, 100); if (!m) return null;
+  const tex = usdaTexture(m.sand, m.silt, m.clay); if (!tex) return null;
+  return { source: "ISRIC SoilGrids 2.0", key: tex, name: null, pct: null, depth: m.depth, sand: m.sand, silt: m.silt, clay: m.clay };
+}
+// Tries SSURGO first (inside the US), then SoilGrids. Throws a readable error if neither has data.
+async function soilFromLocation(lat, lon, onStatus) {
+  const inUS = lat >= 17 && lat <= 72 && lon >= -180 && lon <= -64;
+  const notes = [];
+  if (inUS) {
+    try { onStatus && onStatus("Querying USDA SSURGO…"); const s = await soilFromSSURGO(lat, lon); if (s) return s; notes.push("no SSURGO soil at this point (urban, water or unmapped)"); }
+    catch (e) { notes.push("SSURGO: " + e.message); }
+  }
+  try { onStatus && onStatus("Querying ISRIC SoilGrids (can take ~20 s)…"); const s = await soilFromSoilGrids(lat, lon); if (s) return s; notes.push("SoilGrids has no soil at this point"); }
+  catch (e) { notes.push("SoilGrids: " + e.message); }
+  throw new Error(notes.join("; "));
+}
+if (typeof module !== "undefined") module.exports = { usdaTexture, profileMean, soilFromSSURGO, soilFromSoilGrids, soilFromLocation };
+
 </script>
 <script>
 // ===================== AquaCrop-Web app logic =====================
@@ -3023,6 +3110,46 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
 
   const cropOptions = Object.keys(CROPS).map(k => `<option value="${k}">${CROPS[k].label}</option>`).join("");
   const soilOptions = Object.keys(SOILS).map(k => `<option value="${k}" ${k === "loam" ? "selected" : ""}>${SOILS[k].label}</option>`).join("");
+
+  // ---- editable soil hydraulic parameters (defaults come from the selected texture class) ----
+  const SOIL_PARAMS = [["fc", "Field capacity θFC", "m³/m³", 0.01, 0.05, 0.6], ["wp", "Wilting point θPWP", "m³/m³", 0.01, 0.01, 0.4], ["sat", "Saturation θSAT", "m³/m³", 0.01, 0.2, 0.7], ["cn2", "Curve number CN", "–", 1, 30, 98], ["rew", "Readily evaporable water REW", "mm", 1, 1, 20]];
+  const soilParamsHTML = (selId) => `
+    <details class="soilparams" data-soil-select="${selId}" style="margin-top:6px">
+      <summary style="cursor:pointer;font-size:12.5px;color:var(--ink-soft,inherit)">Soil parameters <span class="sp-flag" style="font-style:italic"></span></summary>
+      <div class="row-inline" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+        ${SOIL_PARAMS.map(([k, lbl, unit, step, mn, mx]) => `<div class="field" style="min-width:120px"><label>${lbl} (${unit})</label><input type="number" data-sp="${k}" step="${step}" min="${mn}" max="${mx}"></div>`).join("")}
+      </div>
+      <div class="btnrow" style="align-items:center;gap:8px;margin-top:2px"><button type="button" class="btn ghost sp-reset" style="padding:4px 10px">Reset to class defaults</button><span class="sp-msg hint" style="margin:0"></span></div>
+      <div class="hint">Defaults are typical values for the selected texture class. Edit them with measured values (e.g. from a lab analysis or soil survey) — changes apply to this scenario only and are cleared when you pick another soil class.</div>
+    </details>`;
+  const spBlock = (selId) => document.querySelector(`.soilparams[data-soil-select="${selId}"]`);
+  function spFill(selId) {
+    const b = spBlock(selId), sel = document.getElementById(selId); if (!b || !sel) return;
+    const d = SOILS[sel.value]; if (!d) return;
+    SOIL_PARAMS.forEach(([k]) => { b.querySelector(`[data-sp="${k}"]`).value = d[k]; });
+    spFlag(b);
+  }
+  function spModified(b, d) { return SOIL_PARAMS.some(([k]) => { const v = parseFloat(b.querySelector(`[data-sp="${k}"]`).value); return isFinite(v) && Math.abs(v - d[k]) > 1e-9; }); }
+  function spFlag(b) {
+    const sel = document.getElementById(b.dataset.soilSelect), d = sel && SOILS[sel.value]; if (!d) return;
+    const m = spModified(b, d), v = n => parseFloat(b.querySelector(`[data-sp="${n}"]`).value);
+    b.querySelector(".sp-flag").textContent = m ? "(modified)" : "(class defaults)";
+    let warn = ""; if (v("wp") >= v("fc")) warn = "Wilting point must be below field capacity."; else if (v("fc") >= v("sat")) warn = "Field capacity must be below saturation.";
+    b.querySelector(".sp-msg").innerHTML = warn ? `<span class="status err">${warn}</span>` : "";
+  }
+  // the soil object used by the simulation: class defaults overridden by any edited values
+  function soilForSelect(selId) {
+    const sel = document.getElementById(selId), base = SOILS[sel.value], b = spBlock(selId); if (!b) return base;
+    const o = Object.assign({}, base); let mod = false;
+    SOIL_PARAMS.forEach(([k]) => { const v = parseFloat(b.querySelector(`[data-sp="${k}"]`).value); if (isFinite(v) && Math.abs(v - base[k]) > 1e-9) { o[k] = v; mod = true; } });
+    if (o.wp >= o.fc || o.fc >= o.sat) throw new Error("Soil parameters must satisfy wilting point < field capacity < saturation.");
+    if (mod) o.label = base.label + " (modified)";
+    return o;
+  }
+  document.addEventListener("change", e => { const el = e.target; if (el && el.tagName === "SELECT" && spBlock(el.id)) spFill(el.id); });
+  document.addEventListener("input", e => { const b = e.target && e.target.closest && e.target.closest(".soilparams"); if (b) spFlag(b); });
+  document.addEventListener("click", e => { const r = e.target && e.target.closest && e.target.closest(".sp-reset"); if (r) spFill(r.closest(".soilparams").dataset.soilSelect); });
+  setTimeout(() => document.querySelectorAll(".soilparams").forEach(b => spFill(b.dataset.soilSelect)), 0);
 
   // ---------------------------------------------------------------
   // CROP CALIBRATION OVERRIDES — shared store, keyed by crop id.
@@ -3057,6 +3184,21 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     sharedLocation.lat = lat; sharedLocation.lon = lon;
     locationListeners.forEach(fn => fn(sharedLocation));
   }
+  document.addEventListener("click", async (e) => {
+    const b = e.target && e.target.closest && e.target.closest(".soil-from-loc"); if (!b) return;
+    const msg = b.parentElement.querySelector(".soil-from-loc-msg"), sel = document.getElementById(b.dataset.soilSelect);
+    let lat = sharedLocation.lat, lon = sharedLocation.lon;
+    if (b.dataset.lat) { lat = parseFloat((document.getElementById(b.dataset.lat) || {}).value); lon = parseFloat((document.getElementById(b.dataset.lon) || {}).value); }
+    if (!sel || !isFinite(lat) || !isFinite(lon)) { msg.innerHTML = '<span class="status err">Set a valid latitude / longitude first.</span>'; return; }
+    b.disabled = true; msg.innerHTML = '<span class="spinner"></span>Looking up soil…';
+    try {
+      const s = await soilFromLocation(lat, lon, m => { msg.innerHTML = `<span class="spinner"></span>${m}`; });
+      sel.value = s.key; sel.dispatchEvent(new Event("change", { bubbles: true }));
+      const f = v => v.toFixed(0);
+      msg.innerHTML = `<span class="status ok">${SOILS[s.key].label}</span> — ${s.source}${s.name ? `: ${s.name}${s.pct ? ` (${s.pct}% of the map unit)` : ""}` : ""}; 0–${f(s.depth)} cm average sand ${f(s.sand)} / silt ${f(s.silt)} / clay ${f(s.clay)} % at ${lat.toFixed(4)}, ${lon.toFixed(4)}. Check it matches your field.`;
+    } catch (err) { msg.innerHTML = `<span class="status err">Couldn't get soil data: ${err.message}. Choose the soil type manually.</span>`; }
+    finally { b.disabled = false; }
+  });
   function onLocationChange(fn) { locationListeners.push(fn); fn(sharedLocation); }
 
   // ---------------------------------------------------------------
@@ -3089,6 +3231,8 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
         <div class="field">
           <label>Soil type (root zone)</label>
           <select id="${prefix}-soil">${soilOptions}</select>
+          ${soilParamsHTML(prefix + "-soil")}
+          <div class="btnrow" style="gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px"><button type="button" class="btn secondary soil-from-loc" data-soil-select="${prefix}-soil" data-lat="" data-lon="">Get soil from location</button><span class="soil-from-loc-msg hint" style="margin:0"></span></div>
         </div>
 
         <div class="row-inline">
@@ -3540,7 +3684,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
     const g = id => document.getElementById(`${prefix}-${id}`);
     const cropKey = g("crop").value;
     const baseCrop = getCropDef(cropKey);
-    const soil = SOILS[g("soil").value];
+    const soil = soilForSelect(`${prefix}-soil`);
     const sowDate = g("sowdate").value;
     const lat = sharedLocation.lat, lon = sharedLocation.lon;
 
@@ -4349,8 +4493,10 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       q("start").value = `${y}-${md}`; q("end").value = isoAdd(q("start").value, Math.max(30, o.getSeasonDays()) - 1);
       q("go").disabled = false; showLoc();
       q("status").innerHTML = '<span class="status">Check the season dates, then fetch.</span>';
+      syncSetupSowDate(q("start").value);
       update();
     });
+    q("start").addEventListener("change", () => syncSetupSowDate(q("start").value));
     ["start", "end"].forEach(k => q(k).addEventListener("change", update));
     q("go").addEventListener("click", async () => {
       const st = q("status"), start = q("start").value, end = q("end").value;
@@ -4473,7 +4619,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
       g("cal-preview-chart").innerHTML = lineChart({ data, series: [{ key: "cc", color: "#7cab5a", area: true, label: "Canopy cover" }], nDays, yMax: 1.0, yFmt: v => (v * 100).toFixed(0) + "%" });
     }
 
-    cropSel.addEventListener("change", () => { g("cal-adv-unlock").checked = false; loadCropIntoForm(cropSel.value); applyAdvLock(); });
+    cropSel.addEventListener("change", () => { g("cal-adv-unlock").checked = false; loadCropIntoForm(cropSel.value); applyAdvLock(); syncSetupCrop(cropSel.value); });
     g("cal-adv-unlock").addEventListener("change", applyAdvLock);
     function handleFieldChange(e) {
       if (!e.target.closest("fieldset")) return;
@@ -4514,7 +4660,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
         } catch (e) { errs.push(`${f.name}: ${e.message}`); }
       }
       if (loaded.length) {
-        cropSel.value = loaded[0]; g("cal-adv-unlock").checked = false;
+        cropSel.value = loaded[0]; syncSetupCrop(loaded[0]); g("cal-adv-unlock").checked = false;
         loadCropIntoForm(loaded[0]); applyAdvLock();
         loaded.forEach(refreshStageFieldsFor);
       }
@@ -4591,6 +4737,19 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
   // ---------------------------------------------------------------
   // CALIBRATION TAB — field data per year -> crop parameters
   // ---------------------------------------------------------------
+  // Parameters tab → Setup: keep the scenario crop and planting date in step with what is chosen on the Parameters tab
+  function syncSetupCrop(cropKey) {
+    document.querySelectorAll('select[id$="-crop"]').forEach(sel => {
+      if (sel.id.startsWith("cal") || sel.value === cropKey || !sel.querySelector(`option[value="${cropKey}"]`)) return;
+      sel.value = cropKey; sel.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+  function syncSetupSowDate(iso) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || "")) return;
+    document.querySelectorAll('input[type="date"][id$="-sowdate"]').forEach(inp => {
+      if (inp.value === iso) return; inp.value = iso; inp.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
   function refreshStageFieldsFor(cropKey) {
     document.querySelectorAll('select[id$="-crop"]').forEach(sel => {
       if (sel.id.startsWith("cal") || sel.value !== cropKey) return;
@@ -4664,7 +4823,7 @@ if (typeof module !== "undefined") module.exports = { ccNdviChart, latLonToUTM, 
                 <div class="field"><label>Planting date</label><input type="date" id="${p}plant"></div>
                 <div class="field"><label>Harvest date</label><input type="date" id="${p}harvest"></div>
               </div>
-              <div class="field"><label>Soil type</label><select id="${p}soil">${soilOptions}</select></div>
+              <div class="field"><label>Soil type</label><select id="${p}soil">${soilOptions}</select>${soilParamsHTML(p + "soil")}<div class="btnrow" style="gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px"><button type="button" class="btn secondary soil-from-loc" data-soil-select="${p}soil" data-lat="${p}lat" data-lon="${p}lon">Get soil from location</button><span class="soil-from-loc-msg hint" style="margin:0"></span></div></div>
             </fieldset>
             <fieldset><legend>Yield</legend>
               <div class="row-inline">
@@ -4964,7 +5123,7 @@ date,cc_percent,biomass_t_ha
         const stageDays = {};
         STAGE_INPUTS.forEach(([k]) => { const v = g("st-" + k).value; stageDays[k] = v ? daysBetweenISO(planting, v) + 1 : null; if (stageDays[k] != null && (stageDays[k] < 1 || stageDays[k] > nDays + 60)) throw new Error(`${label}: ${k} date is outside the season`); });
         const yv = parseFloat(g("yield").value);
-        runs.push({ id, label, planting, harvest, lat: parseFloat(g("lat").value), lon: parseFloat(g("lon").value), nDays, weather, events, soil: SOILS[g("soil").value], soilKey: g("soil").value,
+        runs.push({ id, label, planting, harvest, lat: parseFloat(g("lat").value), lon: parseFloat(g("lon").value), nDays, weather, events, soil: soilForSelect(`y${id}-soil`), soilKey: g("soil").value,
           stageDays, yield: isNaN(yv) ? null : yv, yieldBasis: g("ybasis").value || defBasis, extra: readExtra(g("extra").value, planting), validation: g("hold").checked, irrMode });
       }
       return runs;
@@ -5108,6 +5267,7 @@ date,cc_percent,biomass_t_ha
 
     <h3>Parameter groups and the satellite check</h3>
     <p>On the <strong>Parameters</strong> tab, cultivar- and management-dependent values (stage timing, CC₀, CCx, root depth, HI₀) are edited directly. The <em>conservative</em> parameters — WP*, canopy growth/decline rates, Kcb, harvest-index stress effects and the water-stress thresholds — sit in a collapsed Advanced section that stays locked until you confirm; change them only with values calibrated under real, controlled field conditions. Any crop can be exported to, and re-imported from, a small CSV (<code>crop, parameter, value</code>). When a simulation runs, NDVI for the simulated season is fetched automatically and added to the Results canopy-cover chart on a second (right) axis. In the canopy development review on the Parameters tab, the <strong>satellite check</strong> (choose a growing-season year) downloads Sentinel-2 L2A reflectance from the free Earth Search STAC catalogue (AWS Open Data), masks clouds/shadows with the scene classification layer, averages the reflectances over a 3×3-pixel window at the field coordinates and computes NDVI = (NIR−Red)/(NIR+Red). NDVI is plotted on the canopy preview as a plausibility check of timing and shape, and an optional button keeps CC₀ and CCx and refits CGC, CDC and the senescence timing so the season follows the NDVI pattern (NDVI rescaled onto the CC range); NDVI is a vegetation index, not canopy cover (it includes soil background and saturates at high cover), so treat the fit as a starting point.</p>
+    <p><strong>Soil from location.</strong> The “Get soil from location” button next to the soil selector reads the soil at the chosen coordinates — USDA SSURGO (Soil Data Access) inside the US, otherwise ISRIC SoilGrids 2.0 (250 m) — averages sand/silt/clay over the top 100 cm (dominant SSURGO component), and selects the matching USDA texture class from the list used by the model. It is a first guess from mapped soil data; confirm it against your own soil information. The soil's field capacity, wilting point, saturation, curve number and REW start from the class defaults and can be edited in the “Soil parameters” section under the soil selector.</p>
     <h3>Canopy cover (CC)</h3>
     <p>Canopy cover grows from an initial value CC₀ through an exponential phase, transitions to a logistic phase as it approaches CCx, then declines exponentially after the onset of senescence:</p>
     <div class="eq">Growth (CC ≤ CCx/2):   CC(t) = CC₀ · exp(CGC·t)
